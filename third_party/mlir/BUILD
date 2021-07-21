@@ -33,9 +33,6 @@ exports_files([
 filegroup(
     name = "c_headers",
     srcs = glob(["include/mlir-c/**/*"]),  # <== i.e. match the entire tree
-    visibility = [
-        ":friends",
-    ],
 )
 
 exports_files(glob(["include/**/*.td"]))
@@ -1452,6 +1449,7 @@ cc_library(
         ":SCFDialect",
         ":SCFPassIncGen",
         ":StandardOps",
+        ":Support",
         ":Transforms",
         "@llvm-project//llvm:Support",
     ],
@@ -2038,6 +2036,7 @@ cc_library(
         ":Affine",
         ":DialectUtils",
         ":IR",
+        ":InferTypeOpInterface",
         ":LinalgInterfacesIncGen",
         ":LinalgStructuredOpsIncGen",
         ":MemRefDialect",
@@ -2435,6 +2434,14 @@ gentbl_cc_library(
         (
             ["-gen-op-interface-defs"],
             "include/mlir/Dialect/LLVMIR/LLVMOpsInterfaces.cpp.inc",
+        ),
+        (
+            ["-gen-type-interface-decls"],
+            "include/mlir/Dialect/LLVMIR/LLVMTypeInterfaces.h.inc",
+        ),
+        (
+            ["-gen-type-interface-defs"],
+            "include/mlir/Dialect/LLVMIR/LLVMTypeInterfaces.cpp.inc",
         ),
     ],
     tblgen = ":mlir-tblgen",
@@ -5849,6 +5856,7 @@ cc_library(
         ":LLVMDialect",
         ":LinalgOps",
         ":LinalgTransforms",
+        ":MemRefToLLVM",
         ":Pass",
         ":SCFDialect",
         ":SCFToStandard",
@@ -5985,10 +5993,12 @@ cc_library(
         "lib/Dialect/Linalg/Transforms/*.cpp",
         "lib/Dialect/Linalg/Transforms/*.h",
     ]) + [
+        "lib/Dialect/Linalg/Analysis/ConstraintsSet.cpp",
         "lib/Dialect/Linalg/Analysis/DependenceAnalysis.cpp",
         "lib/Dialect/Linalg/Utils/Utils.cpp",
     ],
     hdrs = [
+        "include/mlir/Dialect/Linalg/Analysis/ConstraintsSet.h",
         "include/mlir/Dialect/Linalg/Analysis/DependenceAnalysis.h",
         "include/mlir/Dialect/Linalg/Passes.h",
         "include/mlir/Dialect/Linalg/Transforms/CodegenStrategy.h",

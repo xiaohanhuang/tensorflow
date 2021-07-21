@@ -31,7 +31,6 @@ limitations under the License.
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/Dialect/Quant/QuantOps.h"  // from @llvm-project
-#include "mlir/Dialect/Quant/QuantTypes.h"  // from @llvm-project
 #include "mlir/Dialect/SCF/SCF.h"  // from @llvm-project
 #include "mlir/Dialect/StandardOps/IR/Ops.h"  // from @llvm-project
 #include "mlir/IR/Attributes.h"  // from @llvm-project
@@ -89,10 +88,11 @@ Attribute Quantize(float value, Attribute scale_attr, Attribute zp_attr,
 }
 
 // Decompose the TF ops with the registered composition library.
-struct DecomposeTFOpsPass
+class DecomposeTFOpsPass
     : public PassWrapper<DecomposeTFOpsPass, FunctionPass> {
+ public:
   explicit DecomposeTFOpsPass(llvm::Optional<ModuleOp> external_tfr_module)
-      : external_tfr_module(external_tfr_module) {}
+      : external_tfr_module_(external_tfr_module) {}
 
   StringRef getArgument() const final { return "tfr-decompose"; }
 
@@ -106,11 +106,6 @@ struct DecomposeTFOpsPass
   // Apply canonicalization, mainly constant folding, on the function.
   void ApplyCanonicalization();
 
-  // Remove quantization parameters from input and output values, after a proper
-  // rescaling is already baked into the graph. This will only happen for the
-  // entry function.
-  void RemoveQuantizationParamsFromIO();
-
   // Rewrite unregistered TF ops to TFR func call ops. Return failure if all the
   // ops are registered or the compose function doesn't exist.
   LogicalResult RewriteUnregisteredTFOps();
@@ -119,7 +114,7 @@ struct DecomposeTFOpsPass
   LogicalResult InlineTFRFuncCalls();
 
   // Optional external symbol table to look up the TFR function.
-  llvm::Optional<ModuleOp> external_tfr_module;
+  llvm::Optional<ModuleOp> external_tfr_module_;
 };
 
 #include "tensorflow/compiler/mlir/tfr/passes/generated_decompose.inc"
@@ -136,8 +131,8 @@ void DecomposeTFOpsPass::ApplyCanonicalization() {
 
 LogicalResult DecomposeTFOpsPass::RewriteUnregisteredTFOps() {
   FuncOp func = getFunction();
-  SymbolTable table(external_tfr_module.hasValue()
-                        ? *external_tfr_module
+  SymbolTable table(external_tfr_module_.hasValue()
+                        ? *external_tfr_module_
                         : func->getParentOfType<ModuleOp>());
   OpBuilder builder(func);
   bool changed = false;
@@ -269,8 +264,8 @@ LogicalResult DecomposeTFOpsPass::InlineTFRFuncCalls() {
   // The Inliner will automatically use the registered dialect inliner.
   InlinerInterface inliner(&getContext());
   FuncOp func = getFunction();
-  SymbolTable table(external_tfr_module.hasValue()
-                        ? *external_tfr_module
+  SymbolTable table(external_tfr_module_.hasValue()
+                        ? *external_tfr_module_
                         : func->getParentOfType<ModuleOp>());
 
   // The inliner only inlines the TFR call op.
@@ -318,67 +313,6 @@ LogicalResult DecomposeTFOpsPass::InlineTFRFuncCalls() {
   return success(changed);
 }
 
-void DecomposeTFOpsPass::RemoveQuantizationParamsFromIO() {
-  FuncOp func = getFunction();
-  OpBuilder builder(func);
-  Block& block = func.front();
-  Operation* terminator = block.getTerminator();
-
-  // Replace input_arg(tensor<quant_type>) -> tfr.cast
-  // with input_arg(tensor<storage_type>) -> tfr.cast
-  for (BlockArgument arg : block.getArguments()) {
-    Type arg_type = arg.getType();
-    if (auto quant_type = arg_type.cast<TensorType>()
-                              .getElementType()
-                              .dyn_cast<quant::QuantizedType>()) {
-      if (arg.hasOneUse() && llvm::isa<TFR::CastOp>(*arg.user_begin())) {
-        arg.setType(
-            arg_type.cast<TensorType>().clone(quant_type.getStorageType()));
-      } else {
-        std::string error_message;
-        llvm::raw_string_ostream os{error_message};
-        os << "The argument with type ";
-        arg.getType().print(os);
-        os << " should have one user, which should be tfr.cast.";
-        func->emitError(error_message);
-        return;
-      }
-    }
-  }
-
-  builder.setInsertionPoint(terminator);
-  // Replace tfr.cast(tensor<quant_type>) -> output
-  // with tfr.cast(tensor<storage_type>) -> quant
-
-  for (OpOperand& returned_value : terminator->getOpOperands()) {
-    auto returned_type = returned_value.get().getType().dyn_cast<TensorType>();
-    if (!returned_type ||
-        !returned_type.getElementType().isa<quant::QuantizedType>()) {
-      continue;
-    }
-
-    if (auto returned_op = returned_value.get().getDefiningOp<TFR::CastOp>()) {
-      auto new_type = returned_type.clone(returned_type.getElementType()
-                                              .cast<quant::QuantizedType>()
-                                              .getStorageType());
-      auto new_op = builder.create<TFR::CastOp>(returned_op->getLoc(), new_type,
-                                                returned_op.arg());
-      returned_value.set(new_op.getResult());
-      if (returned_op.use_empty()) {
-        returned_op.erase();
-      }
-    } else {
-      returned_value.get().getDefiningOp()->emitError(
-          "The producer of quantized type result should be a tfr.cast op");
-      return;
-    }
-  }
-
-  auto new_func_type = builder.getFunctionType(block.getArgumentTypes(),
-                                               terminator->getOperandTypes());
-  func.setType(new_func_type);
-}
-
 void DecomposeTFOpsPass::runOnFunction() {
   // Set a maximum iteration threshold in case there are infinite loops in the
   // call stack.
@@ -397,10 +331,6 @@ void DecomposeTFOpsPass::runOnFunction() {
       break;
     }
   } while (max_iterators-- >= 0);
-
-  // Replace input/outputs with quantized type to their corresponding storage
-  // types. ex) tensor<1x10x!quant.uniform<i8:f32>> becomes tensor<1x10xi8>
-  RemoveQuantizationParamsFromIO();
 }
 
 }  // namespace
