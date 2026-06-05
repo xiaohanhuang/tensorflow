@@ -16,8 +16,10 @@ limitations under the License.
 #include <pybind11/stl.h>
 
 #include <memory>
+#include <vector>
 
-#include "pybind11/pybind11.h"
+#include "absl/types/span.h"
+#include "pybind11/pybind11.h"  // from @pybind11
 #include "tensorflow/c/eager/abstract_context.h"
 #include "tensorflow/c/eager/abstract_function.h"
 #include "tensorflow/c/eager/abstract_operation.h"
@@ -30,6 +32,7 @@ limitations under the License.
 #include "tensorflow/c/eager/immediate_execution_tensor_handle.h"
 #include "tensorflow/c/eager/tfe_context_internal.h"
 #include "tensorflow/c/eager/tfe_tensorhandle_internal.h"
+#include "tensorflow/c/safe_ptr.h"
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/lib/core/status.h"
@@ -39,7 +42,7 @@ limitations under the License.
 #include "tensorflow/python/eager/pywrap_tensor.h"
 #include "tensorflow/python/lib/core/pybind11_lib.h"
 #include "tensorflow/python/lib/core/pybind11_status.h"
-#include "tensorflow/python/lib/core/safe_ptr.h"
+#include "tensorflow/python/lib/core/safe_pyobject_ptr.h"
 
 namespace py = pybind11;
 
@@ -74,7 +77,6 @@ using tensorflow::Safe_TF_StatusPtr;
 using tensorflow::Status;
 using tensorflow::string;
 using tensorflow::TFE_TensorHandleToNumpy;
-using tensorflow::core::RefCountPtr;
 
 using tensorflow::errors::Internal;
 using tensorflow::errors::InvalidArgument;
@@ -92,14 +94,14 @@ PYBIND11_MODULE(_unified_api, m) {
     MaybeRaiseRegisteredFromTFStatus(status.get());
     if (!ctx) {
       MaybeRaiseRegisteredFromStatus(
-          Internal("TF_CreateFunction returned nullptr"));
+          absl::InternalError("TF_CreateFunction returned nullptr"));
     }
     if (!isa<TracingContext>(ctx)) {
       // TODO(srbs): Add a helper to convert the kind enum to a user-friendly
       // string.
-      MaybeRaiseRegisteredFromStatus(
-          Internal("TF_CreateFunction must return a TracingContext, found ",
-                   ctx->getKind()));
+      MaybeRaiseRegisteredFromStatus(absl::InternalError(
+          absl::StrCat("TF_CreateFunction must return a TracingContext, found ",
+                       ctx->getKind())));
     }
     return dyn_cast<TracingContext>(ctx);
   });
@@ -107,7 +109,8 @@ PYBIND11_MODULE(_unified_api, m) {
     TFE_Context* ctx =
         static_cast<TFE_Context*>(PyCapsule_GetPointer(obj.ptr(), nullptr));
     if (!ctx) {
-      MaybeRaiseRegisteredFromStatus(InvalidArgument("TFE_Context is nullptr"));
+      MaybeRaiseRegisteredFromStatus(
+          absl::InvalidArgumentError("TFE_Context is nullptr"));
     }
     return unwrap(ctx);
   });
@@ -118,7 +121,7 @@ PYBIND11_MODULE(_unified_api, m) {
            [](AbstractContext* self, const char* op,
               const char* raw_device_name) {
              auto operation = self->CreateOperation();
-             operation->Reset(op, raw_device_name);
+             (void)operation->Reset(op, raw_device_name);
              return operation;
            })
       .def("RegisterFunction",
@@ -147,22 +150,23 @@ PYBIND11_MODULE(_unified_api, m) {
         OutputList output_list;
         if (outputs.ptr() != Py_None) {
           if (!PyList_Check(outputs.ptr())) {
-            MaybeRaiseRegisteredFromStatus(
-                InvalidArgument("must provide a list of Tensors as inputs"));
+            MaybeRaiseRegisteredFromStatus(absl::InvalidArgumentError(
+                "must provide a list of Tensors as inputs"));
           }
           Py_ssize_t len = PyList_Size(outputs.ptr());
           output_list.outputs.resize(len);
           for (Py_ssize_t i = 0; i < len; ++i) {
             PyObject* elem = PyList_GetItem(outputs.ptr(), i);
             if (!elem) {
-              MaybeRaiseRegisteredFromStatus(
-                  InvalidArgument("Tensor at index  ", i, " is None."));
+              MaybeRaiseRegisteredFromStatus(absl::InvalidArgumentError(
+                  absl::StrCat("Tensor at index  ", i, " is None.")));
             }
             py::handle elem_h = elem;
             AbstractTensorHandle* handle = elem_h.cast<AbstractTensorHandle*>();
             if (!isa<TracingTensorHandle>(handle)) {
-              MaybeRaiseRegisteredFromStatus(InvalidArgument(
-                  "Tensor at index  ", i, " is not a graph tensor."));
+              MaybeRaiseRegisteredFromStatus(
+                  absl::InvalidArgumentError(absl::StrCat(
+                      "Tensor at index  ", i, " is not a graph tensor.")));
             }
             output_list.outputs[i] = handle;
           }
@@ -233,9 +237,9 @@ PYBIND11_MODULE(_unified_api, m) {
         if (!isa<ImmediateExecutionTensorHandle>(self)) {
           // TODO(srbs): Add a helper to convert the kind enum to a
           // user-friendly string.
-          MaybeRaiseRegisteredFromStatus(Internal(
+          MaybeRaiseRegisteredFromStatus(absl::InternalError(absl::StrCat(
               "AbstractTensorHandle.numpy() must be called with an ",
-              "ImmediateExecutionTensorHandle found type: ", self->getKind()));
+              "ImmediateExecutionTensorHandle found type: ", self->getKind())));
         }
         TF_Status s;
         TFE_TensorHandle* handle =
@@ -247,9 +251,9 @@ PYBIND11_MODULE(_unified_api, m) {
 
   m.def("EagerTensorToImmediateExecutionTensorHandle", [](py::object handle) {
     if (!EagerTensor_CheckExact(handle.ptr())) {
-      MaybeRaiseRegisteredFromStatus(
-          InvalidArgument("EagerTensorToImmediateExecutionTensorHandle called "
-                          "with non-EagerTensor."));
+      MaybeRaiseRegisteredFromStatus(absl::InvalidArgumentError(
+          "EagerTensorToImmediateExecutionTensorHandle called "
+          "with non-EagerTensor."));
     }
     TFE_TensorHandle* eager_tensor = EagerTensor_Handle(handle.ptr());
     auto t = static_cast<AbstractTensorHandle*>(unwrap(eager_tensor));
@@ -257,6 +261,7 @@ PYBIND11_MODULE(_unified_api, m) {
     return t;
   });
 
-  py::class_<AbstractFunction, RefCountPtr<AbstractFunction>> AbstractFunction(
-      m, "AbstractFunction");
+  py::class_<AbstractFunction,
+             std::unique_ptr<AbstractFunction, tsl::core::RefCountDeleter>>
+      AbstractFunction(m, "AbstractFunction");
 }

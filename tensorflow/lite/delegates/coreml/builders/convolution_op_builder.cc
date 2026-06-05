@@ -14,12 +14,25 @@ limitations under the License.
 ==============================================================================*/
 #include "tensorflow/lite/delegates/coreml/builders/convolution_op_builder.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <memory>
+#include <string>
+
+#include "mlmodel/format/NeuralNetwork.pb.h"
 #include "google/protobuf/repeated_field.h"
-#include "tensorflow/lite/c/common.h"
+#include "tensorflow/lite/builtin_ops.h"
+#include "tensorflow/lite/core/c/builtin_op_data.h"
+#include "tensorflow/lite/core/c/common.h"
 #include "tensorflow/lite/delegates/coreml/builders/activation_layer_builder.h"
+#include "tensorflow/lite/delegates/coreml/builders/op_builder.h"
 #include "tensorflow/lite/delegates/coreml/builders/op_factory.h"
 #include "tensorflow/lite/delegates/coreml/builders/op_validator.h"
 #include "tensorflow/lite/kernels/internal/optimized/optimized_ops.h"
+#include "tensorflow/lite/kernels/internal/runtime_shape.h"
+#include "tensorflow/lite/kernels/internal/tensor_ctypes.h"
+#include "tensorflow/lite/kernels/internal/types.h"
 #include "tensorflow/lite/kernels/kernel_util.h"
 
 namespace tflite {
@@ -42,7 +55,7 @@ void ConvolutionOpBuilder::SetOutputShape(TfLiteTensor* output_shape) {
 
 CoreML::Specification::NeuralNetworkLayer* ConvolutionOpBuilder::Build() {
   if (layer_ == nullptr) {
-    layer_.reset(new CoreML::Specification::NeuralNetworkLayer);
+    layer_ = std::make_unique<CoreML::Specification::NeuralNetworkLayer>();
   }
   layer_->set_name(DebugName());
 
@@ -168,7 +181,7 @@ void ConvolutionOpBuilder::TransposeKernelWeights() {
   if (weights_->type == kTfLiteFloat32) {
     auto* coreml_weights =
         layer_->mutable_convolution()->mutable_weights()->mutable_floatvalue();
-    coreml_weights->Resize(NumElements(weights_), 0);
+    coreml_weights->resize(NumElements(weights_), 0);
 
     optimized_ops::Transpose<float>(params, tfl_shape, weights_->data.f,
                                     coreml_shape,

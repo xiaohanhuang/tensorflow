@@ -23,12 +23,18 @@ limitations under the License.
 // automatically move <Python.h> before <locale>.
 #include <Python.h>
 
+#include <string>
+#include <tuple>
+#include <utility>
+
 #include "absl/container/flat_hash_map.h"
 #include "absl/hash/hash.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "tensorflow/c/eager/c_api.h"
 #include "tensorflow/core/common_runtime/eager/tensor_handle.h"
 #include "tensorflow/core/framework/types.pb.h"
+#include "tensorflow/core/platform/logging.h"
 
 namespace tensorflow {
 
@@ -41,7 +47,10 @@ namespace tensorflow {
 struct PyObjectPtr {
   template <typename H>
   friend H AbslHashValue(H h, const PyObjectPtr& obj) {
-    return H::combine(std::move(h), PyObject_Hash(obj.ptr));
+    Py_hash_t hash = PyObject_Hash(obj.ptr);
+    CHECK_NE(hash, -1);        // Crash OK
+    CHECK(!PyErr_Occurred());  // Crash OK
+    return H::combine(std::move(h), hash);
   }
 
   explicit PyObjectPtr(PyObject* ptr) : ptr(ptr) {}
@@ -70,7 +79,17 @@ struct TFE_TensorHandleCache {
   static TFE_TensorHandleCache* Get();
 
   TFE_TensorHandleCache() { cache.reserve(64); }
-  ~TFE_TensorHandleCache() { DecrefUnrefAll(); }
+
+  TFE_TensorHandleCache(const TFE_TensorHandleCache&) = delete;
+  TFE_TensorHandleCache& operator=(const TFE_TensorHandleCache&) = delete;
+
+  ~TFE_TensorHandleCache() {
+#ifdef Py_GIL_DISABLED
+    absl::MutexLock lock(&mu_);
+#endif  // Py_GIL_DISABLED
+
+    DecrefUnrefAll();
+  }
 
   TFE_TensorHandle* Lookup(PyObject* value, tensorflow::DataType dtype,
                            TFE_Context* ctx,
@@ -85,18 +104,22 @@ struct TFE_TensorHandleCache {
   // TODO(kkb): Instead of `TFE_Context*` key, ideally Python's context object
   // should have TFE_TensorHandleCache instance. Migrate once we Python context
   // object is backed by C++ data structure. b/169790439
-  using Key = std::tuple<PyObjectPtr, tensorflow::DataType, TFE_Context*,
-                         absl::string_view>;
+  using Key =
+      std::tuple<PyObjectPtr, tensorflow::DataType, TFE_Context*, std::string>;
 
   void DecrefUnrefAll() {
-    for (const auto& p : cache) {
-      Py_DECREF(static_cast<PyObject*>(std::get<0>(p.first)));
-      TFE_DeleteTensorHandle(p.second);
+    for (const auto& [key, handle] : cache) {
+      Py_DECREF(static_cast<PyObject*>(std::get<0>(key)));
+      TFE_DeleteTensorHandle(handle);
     }
   }
 
-  // Not guarded by a mutex because the code is only used while the
-  // GIL is held.
+#ifdef Py_GIL_DISABLED
+  mutable absl::Mutex mu_;
+#endif  // Py_GIL_DISABLED
+
+  // Under a GIL-enabled Python, guarded by the GIL. Under a no-GIL Python,
+  // guarded by mu_.
   absl::flat_hash_map<Key, TFE_TensorHandle*> cache;
 };
 

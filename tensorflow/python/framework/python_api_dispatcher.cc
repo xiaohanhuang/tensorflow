@@ -15,26 +15,42 @@ limitations under the License.
 
 #include "tensorflow/python/framework/python_api_dispatcher.h"
 
-#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
-#include "tensorflow/core/platform/logging.h"
-#include "tensorflow/core/platform/macros.h"
 #include "tensorflow/python/lib/core/py_util.h"
 #include "tensorflow/python/lib/core/safe_pyobject_ptr.h"
-#include "tensorflow/python/util/util.h"
 
 namespace tensorflow {
 namespace py_dispatch {
 
 namespace {
 
+PyObject* ImportTypeFromModule(const char* module_name, const char* type_name) {
+  static PyObject* given_type = [module_name, type_name]() {
+    PyObject* module = PyImport_ImportModule(module_name);
+    PyObject* attr =
+        module ? PyObject_GetAttrString(module, type_name) : nullptr;
+    if (attr == nullptr) {
+      PyErr_WriteUnraisable(nullptr);
+      PyErr_Clear();
+    }
+    if (module) Py_DECREF(module);
+    return attr;
+  }();
+  return given_type;
+}
+
 std::vector<Safe_PyObjectPtr>& GetRegisteredDispatchableTypes() {
   static std::vector<Safe_PyObjectPtr>* registered_dispatchable_types =
       new std::vector<Safe_PyObjectPtr>();
   if (registered_dispatchable_types->empty()) {
-    static PyObject* composite_tensor =
-        swig::GetRegisteredPyObject("CompositeTensor");
+    static PyObject* composite_tensor = ImportTypeFromModule(
+        "tensorflow.python.framework.composite_tensor",
+        "CompositeTensor");
     Py_INCREF(composite_tensor);
     registered_dispatchable_types->push_back(
         Safe_PyObjectPtr(composite_tensor));
@@ -85,7 +101,7 @@ bool RegisterDispatchableType(PyObject* py_class) {
     Safe_PyObjectPtr s(PyObject_Str(py_class));
     PyErr_SetString(PyExc_ValueError,
                     absl::StrCat("Type ", s ? PyUnicode_AsUTF8(s.get()) : "?",
-                                 " (or one of its bases clases) has "
+                                 " (or one of its bases classes) has "
                                  "already been registered")
                         .c_str());
     return false;
@@ -98,10 +114,7 @@ bool RegisterDispatchableType(PyObject* py_class) {
 PythonAPIDispatcher::PythonAPIDispatcher(const std::string& api_name,
                                          absl::Span<const char*> arg_names,
                                          absl::Span<PyObject*> defaults)
-    : api_name_(api_name),
-      canonicalizer_(arg_names, defaults),
-      canonicalized_args_storage_(canonicalizer_.GetArgSize()),
-      canonicalized_args_span_(canonicalized_args_storage_) {}
+    : api_name_(api_name), canonicalizer_(arg_names, defaults) {}
 
 void PythonAPIDispatcher::Register(PySignatureChecker signature_checker,
                                    PyObject* dispatch_target) {
@@ -118,13 +131,28 @@ Safe_PyObjectPtr PythonAPIDispatcher::Dispatch(PyObject* args,
     kwargs = nullptr;
   }
   // Canonicalize args (so we don't need to deal with kwargs).
-  if (!canonicalizer_.Canonicalize(args, kwargs, canonicalized_args_span_)) {
+  std::vector<PyObject*> canonicalized_args_storage(
+      canonicalizer_.GetArgSize());
+  absl::Span<PyObject*> canonicalized_args_span(
+      canonicalized_args_storage.data(), canonicalized_args_storage.size());
+
+  if (!canonicalizer_.Canonicalize(args, kwargs, canonicalized_args_span)) {
     return nullptr;
   }
 
+  // Make a copy of targets to avoid iterator invalidation if
+  // Register/Unregister are called re-entrantly during CheckCanonicalizedArgs.
+  std::vector<std::pair<PySignatureChecker, Safe_PyObjectPtr>> targets_snapshot;
+  targets_snapshot.reserve(targets_.size());
+  for (const auto& target : targets_) {
+    PyObject* obj = target.second.get();
+    Py_INCREF(obj);
+    targets_snapshot.emplace_back(target.first, make_safe(obj));
+  }
+
   PyObject* selected = nullptr;
-  for (auto& target : targets_) {
-    if (target.first.CheckCanonicalizedArgs(canonicalized_args_span_)) {
+  for (auto& target : targets_snapshot) {
+    if (target.first.CheckCanonicalizedArgs(canonicalized_args_span)) {
       if (selected && selected != target.second.get()) {
         return RaiseDispatchConflictError(api_name_, selected,
                                           target.second.get());
@@ -153,7 +181,7 @@ void PythonAPIDispatcher::Unregister(PyObject* func) {
 
 std::string PythonAPIDispatcher::DebugString() const {
   DCheckPyGilState();
-  std::string out = absl::StrCat("<Disptach(", api_name_, "): ");
+  std::string out = absl::StrCat("<Dispatch(", api_name_, "): ");
 
   const char* sep = "";
   for (const auto& target : targets_) {
@@ -261,6 +289,7 @@ int PyInstanceChecker::cost() const { return py_classes_.size(); }
 std::string PyInstanceChecker::DebugString() const {
   DCheckPyGilState();
   std::vector<const char*> type_names;
+  type_names.reserve(py_classes_.size());
   for (const auto& py_class : py_classes_) {
     type_names.push_back(
         reinterpret_cast<PyTypeObject*>(py_class.get())->tp_name);

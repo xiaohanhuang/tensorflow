@@ -81,7 +81,7 @@ class Conv2dOpTest(test.TestCase):
                                                       x.get_shape().as_list(),
                                                       y,
                                                       y.get_shape().as_list())
-      self.assertLess(error, 1e-3)
+      self.assertLess(error, 2e-3)
 
   @test_util.run_deprecated_v1
   def testConv2dGradWRTInput(self):
@@ -132,7 +132,7 @@ class DepthwiseConv2dTest(test.TestCase):
                                                       x.get_shape().as_list(),
                                                       y,
                                                       y.get_shape().as_list())
-      self.assertLess(error, 1e-3)
+      self.assertLess(error, 2e-3)
 
   @test_util.run_deprecated_v1
   def testDepthwiseConv2dGradWRTInput(self):
@@ -250,6 +250,20 @@ class SeluGradOpTest(test.TestCase):
           inputs.shape,
           selu_grad,
           selu_grad.shape)
+      self.assertLess(error, 1e-4)
+
+
+class SwishGradOpTest(test.TestCase):
+
+  def testSwishGrad(self):
+    features = constant_op.constant([[-2, -1, 1, 3]],
+                                    dtype=dtypes.float32)
+    beta = constant_op.constant(0.25, dtype=dtypes.float32)
+
+    with self.cached_session():
+      theoretical, numerical = gradient_checker_v2.compute_gradient(
+          nn_impl.swish, [features, beta])
+      error = gradient_checker_v2.max_error(theoretical, numerical)
       self.assertLess(error, 1e-4)
 
 

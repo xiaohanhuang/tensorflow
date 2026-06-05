@@ -1,28 +1,32 @@
 """Generate custom flex delegate library."""
 
+load("@build_bazel_rules_android//android:rules.bzl", "android_library")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load(
     "//tensorflow:tensorflow.bzl",
-    "clean_dep",
     "if_android",
     "if_ios",
     "if_mobile",
     "tf_cc_binary",
     "tf_copts",
     "tf_defines_nortti_if_lite_protos",
-    "tf_features_nolayering_check_if_android_or_ios",
     "tf_features_nomodules_if_mobile",
     "tf_opts_nortti_if_lite_protos",
     "tf_portable_full_lite_protos",
 )
 load(
     "//tensorflow/lite:build_def.bzl",
+    "clean_dep",
     "tflite_cc_shared_object",
     "tflite_copts",
     "tflite_jni_binary",
     "tflite_jni_linkopts",
 )
-load("@build_bazel_rules_android//android:rules.bzl", "android_library")
-load("//tensorflow/lite:special_rules.bzl", "flex_portable_tensorflow_deps")
+load(
+    "//tensorflow/lite:special_rules.bzl",
+    "flex_portable_tensorflow_deps",
+    "flex_portable_tensorflow_hdrs",
+)
 
 def generate_flex_kernel_header(
         name,
@@ -94,7 +98,8 @@ def tflite_flex_cc_library(
         additional_deps = [],
         testonly = 0,
         visibility = ["//visibility:public"],
-        link_symbol = True):
+        link_symbol = True,
+        compatible_with = None):
     """A rule to generate a flex delegate with only ops to run listed models.
 
     Args:
@@ -105,6 +110,8 @@ def tflite_flex_cc_library(
       additional_deps: Dependencies for additional TF ops.
       testonly: Mark this library as testonly if true.
       visibility: visibility of the generated rules.
+      link_symbol: If true, add delegate_symbol to deps.
+      compatible_with: The standard compatible_with attribute.
     """
     portable_tensorflow_lib = clean_dep("//tensorflow/core:portable_tensorflow_lib")
     if models:
@@ -117,22 +124,30 @@ def tflite_flex_cc_library(
 
         # Define a custom tensorflow_lib with selective registration.
         # The library will only contain ops exist in provided models.
-        native.cc_library(
+        cc_library(
             name = "%s_tensorflow_lib" % name,
             srcs = if_mobile([
-                clean_dep("//tensorflow/core:portable_op_registrations_and_gradients"),
-                clean_dep("//tensorflow/core/kernels:portable_core_ops"),
+                clean_dep("//tensorflow/core/ops:mobile_srcs"),
+                clean_dep("//tensorflow/core/kernels:portable_core_ops_srcs"),
                 clean_dep("//tensorflow/core/kernels:portable_extended_ops"),
             ]) + [CUSTOM_KERNEL_HEADER.header],
+            hdrs = flex_portable_tensorflow_hdrs() + [
+                clean_dep("//tensorflow/core/ops:mobile_hdrs"),
+                clean_dep("//tensorflow/core/kernels:portable_core_ops_hdrs"),
+                clean_dep("//tensorflow/core/kernels:portable_extended_ops_headers"),
+                clean_dep("//tensorflow/core/kernels:portable_quantized_ops_hdrs"),
+            ],
             copts = tf_copts(android_optimization_level_override = None) + tf_opts_nortti_if_lite_protos() + if_ios(["-Os"]),
+            compatible_with = compatible_with,
             defines = [
                 "SELECTIVE_REGISTRATION",
                 "SUPPORT_SELECTIVE_REGISTRATION",
+                "EIGEN_NEON_GEBP_NR=4",
             ] + tf_portable_full_lite_protos(
                 full = [],
                 lite = ["TENSORFLOW_LITE_PROTOS"],
             ) + tf_defines_nortti_if_lite_protos(),
-            features = tf_features_nomodules_if_mobile() + tf_features_nolayering_check_if_android_or_ios(),
+            features = tf_features_nomodules_if_mobile() + if_mobile(["-parse_headers"]),
             linkopts = if_android(["-lz"]) + if_ios(["-lz"]),
             includes = [
                 CUSTOM_KERNEL_HEADER.include_path,
@@ -142,6 +157,7 @@ def tflite_flex_cc_library(
             ],
             visibility = visibility,
             deps = flex_portable_tensorflow_deps() + [
+                clean_dep("@ducc//:fft_wrapper"),
                 clean_dep("//tensorflow/core:protos_all_cc"),
                 clean_dep("//tensorflow/core:portable_tensorflow_lib_lite"),
                 clean_dep("//tensorflow/core/platform:strong_hash"),
@@ -157,29 +173,27 @@ def tflite_flex_cc_library(
         delegate_symbol.append(clean_dep("//tensorflow/lite/delegates/flex:delegate_symbol"))
 
     # Define a custom flex delegate with above tensorflow_lib.
-    native.cc_library(
+    cc_library(
         name = name,
         hdrs = [
             clean_dep("//tensorflow/lite/delegates/flex:delegate.h"),
         ],
-        features = tf_features_nolayering_check_if_android_or_ios(),
+        compatible_with = compatible_with,
         visibility = visibility,
         deps = [
             clean_dep("//tensorflow/lite/delegates/flex:delegate_data"),
             clean_dep("//tensorflow/lite/delegates/flex:delegate_only_runtime"),
             clean_dep("//tensorflow/lite/delegates/utils:simple_delegate"),
         ] + select({
-            clean_dep("//tensorflow:android"): [
-                portable_tensorflow_lib,
-            ],
-            clean_dep("//tensorflow:ios"): [
+            clean_dep("//tensorflow:mobile"): [
                 portable_tensorflow_lib,
             ],
             "//conditions:default": [
                 clean_dep("//tensorflow/core:tensorflow"),
-                clean_dep("//tensorflow/lite/c:common"),
             ],
-        }) + additional_deps + delegate_symbol,
+        }) + [
+            clean_dep("//tensorflow/lite/core/c:private_common"),
+        ] + additional_deps + delegate_symbol,
         testonly = testonly,
         alwayslink = 1,
     )
@@ -216,9 +230,6 @@ def tflite_flex_shared_library(
 
     tflite_cc_shared_object(
         name = name,
-        # Until we have more granular symbol export for the C++ API on Windows,
-        # export all symbols.
-        features = ["windows_export_all_symbols"],
         linkopts = select({
             "//tensorflow:macos": [
                 "-Wl,-exported_symbols_list,$(location //tensorflow/lite/delegates/flex:exported_symbols.lds)",
@@ -269,12 +280,14 @@ def tflite_flex_jni_library(
     )
 
     # Define a custom flex_native that depends on above flex_delegate.
-    native.cc_library(
+    cc_library(
         name = "%s_flex_native" % name,
         srcs = [
-            clean_dep("//tensorflow/lite/testing:init_tensorflow.h"),
             clean_dep("//tensorflow/lite/testing:init_tensorflow.cc"),
             clean_dep("//tensorflow/lite/delegates/flex/java/src/main/native:flex_delegate_jni.cc"),
+        ],
+        hdrs = [
+            clean_dep("//tensorflow/lite/testing:init_tensorflow.h"),
         ],
         copts = tflite_copts(),
         testonly = testonly,
@@ -284,8 +297,9 @@ def tflite_flex_jni_library(
             clean_dep("//tensorflow/lite/java/jni"),
             clean_dep("//tensorflow/lite/delegates/utils:simple_delegate"),
         ] + select({
-            clean_dep("//tensorflow:android"): [],
-            clean_dep("//tensorflow:ios"): [],
+            clean_dep("//tensorflow:mobile"): [
+                clean_dep("//tensorflow/core:portable_tensorflow_lib_lite"),
+            ],
             "//conditions:default": [
                 clean_dep("//tensorflow/core:lib"),
             ],
@@ -330,8 +344,7 @@ def tflite_flex_android_library(
         testonly = testonly,
         visibility = visibility,
     )
-
-    native.cc_library(
+    cc_library(
         name = "%s_native" % name,
         srcs = ["libtensorflowlite_flex_jni.so"],
         testonly = testonly,

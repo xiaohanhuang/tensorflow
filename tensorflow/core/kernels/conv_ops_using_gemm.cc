@@ -308,10 +308,10 @@ class Im2ColConvFunctor {
     // use TensorFlow's resource management to ensure that the memory will be
     // released when the session is over.
     Im2ColBufferResource<T1, chunk_value_count>* im2col_buffer_resource;
-    std::function<Status(Im2ColBufferResource<T1, chunk_value_count>**)>
+    std::function<absl::Status(Im2ColBufferResource<T1, chunk_value_count>**)>
         creator = [](Im2ColBufferResource<T1, chunk_value_count>** resource) {
           *resource = new Im2ColBufferResource<T1, chunk_value_count>();
-          return Status::OK();
+          return absl::OkStatus();
         };
     OP_REQUIRES_OK(context, context->resource_manager()->LookupOrCreate(
                                 "Conv2d", "im2col_buffer",
@@ -433,13 +433,13 @@ class Conv2DUsingGemmOp : public BinaryOp<T> {
   explicit Conv2DUsingGemmOp(OpKernelConstruction* context)
       : BinaryOp<T>(context) {
     OP_REQUIRES_OK(context, context->GetAttr("strides", &strides_));
-    string data_format;
+    std::string data_format;
     OP_REQUIRES_OK(context, context->GetAttr("data_format", &data_format));
     OP_REQUIRES(context, FormatFromString(data_format, &data_format_),
                 errors::InvalidArgument("Invalid data format"));
     OP_REQUIRES(context, data_format_ == FORMAT_NHWC,
-                errors::InvalidArgument(
-                    "Data format not supported by this kernel", data_format));
+                absl::InvalidArgumentError(absl::StrCat(
+                    "Data format not supported by this kernel", data_format)));
     OP_REQUIRES(context, strides_.size() == 4,
                 errors::InvalidArgument("Sliding window strides field must "
                                         "specify 4 dimensions"));
@@ -462,12 +462,14 @@ class Conv2DUsingGemmOp : public BinaryOp<T> {
     const Tensor& filter = context->input(1);
 
     // For 2D convolution, there should be 4 dimensions.
-    OP_REQUIRES(context, input.dims() == 4,
-                errors::InvalidArgument("input must be 4-dimensional",
-                                        input.shape().DebugString()));
-    OP_REQUIRES(context, filter.dims() == 4,
-                errors::InvalidArgument("filter must be 4-dimensional: ",
-                                        filter.shape().DebugString()));
+    OP_REQUIRES(
+        context, input.dims() == 4,
+        absl::InvalidArgumentError(absl::StrCat("input must be 4-dimensional",
+                                                input.shape().DebugString())));
+    OP_REQUIRES(
+        context, filter.dims() == 4,
+        absl::InvalidArgumentError(absl::StrCat(
+            "filter must be 4-dimensional: ", filter.shape().DebugString())));
 
     for (int i = 0; i < 3; i++) {
       OP_REQUIRES(
@@ -480,9 +482,9 @@ class Conv2DUsingGemmOp : public BinaryOp<T> {
     // filter's in_depth.
     const int64_t in_depth = GetTensorDim(input, data_format_, 'C');
     OP_REQUIRES(context, in_depth == filter.dim_size(2),
-                errors::InvalidArgument(
+                absl::InvalidArgumentError(absl::StrCat(
                     "input and filter must have the same depth: ", in_depth,
-                    " vs ", filter.dim_size(2)));
+                    " vs ", filter.dim_size(2))));
 
     // The last dimension for filter is out_depth.
     const int out_depth = static_cast<int>(filter.dim_size(3));
@@ -520,14 +522,16 @@ class Conv2DUsingGemmOp : public BinaryOp<T> {
     const int stride_cols = GetTensorDim(strides_, data_format_, 'W');
 
     int64_t out_rows = 0, out_cols = 0, pad_rows = 0, pad_cols = 0;
+    OP_REQUIRES_OK(context, GetWindowedOutputSize(
+                                input_rows, filter_rows, /*dilation_rate=*/1,
+                                stride_rows, padding_, &out_rows, &pad_rows));
+    OP_REQUIRES_OK(context, GetWindowedOutputSize(
+                                input_cols, filter_cols, /*dilation_rate=*/1,
+                                stride_cols, padding_, &out_cols, &pad_cols));
+    TensorShape out_shape;
     OP_REQUIRES_OK(context,
-                   GetWindowedOutputSize(input_rows, filter_rows, stride_rows,
-                                         padding_, &out_rows, &pad_rows));
-    OP_REQUIRES_OK(context,
-                   GetWindowedOutputSize(input_cols, filter_cols, stride_cols,
-                                         padding_, &out_cols, &pad_cols));
-    TensorShape out_shape =
-        ShapeFromFormat(data_format_, batch, out_rows, out_cols, out_depth);
+                   ShapeFromFormatWithStatus(data_format_, batch, out_rows,
+                                             out_cols, out_depth, &out_shape));
 
     // Output tensor is of the following dimensions:
     // [ in_batch, out_rows, out_cols, out_depth ]
@@ -555,11 +559,12 @@ class Conv2DUsingGemmOp : public BinaryOp<T> {
   }
 
  private:
-  std::vector<int32> strides_;
+  std::vector<int32_t> strides_;
   Padding padding_;
   TensorFormat data_format_;
 
-  TF_DISALLOW_COPY_AND_ASSIGN(Conv2DUsingGemmOp);
+  Conv2DUsingGemmOp(const Conv2DUsingGemmOp&) = delete;
+  void operator=(const Conv2DUsingGemmOp&) = delete;
 };
 
 #define REGISTER_CPU(T)                                         \
@@ -572,8 +577,11 @@ class Conv2DUsingGemmOp : public BinaryOp<T> {
 // request the implementation explicitly, since otherwise it will clash with the
 // default EigenTensor-based kernel.
 #if defined(USE_GEMM_FOR_CONV)
+TF_CALL_bfloat16(REGISTER_CPU);
 TF_CALL_half(REGISTER_CPU);
 TF_CALL_float(REGISTER_CPU);
+TF_CALL_double(REGISTER_CPU);
+TF_CALL_int32(REGISTER_CPU);
 #endif  // USE_GEMM_FOR_CONV
 
 }  // namespace tensorflow

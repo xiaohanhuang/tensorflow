@@ -17,18 +17,18 @@ limitations under the License.
 
 #include <dlfcn.h>
 
+#include "xla/stream_executor/tpu/tpu_api.h"
+#include "xla/stream_executor/tpu/tpu_api_dlsym_set_fn.h"
+#include "xla/stream_executor/tpu/tpu_initialize_util.h"
+#include "xla/stream_executor/tpu/tpu_platform.h"
 #include "tensorflow/core/platform/errors.h"
 #include "tensorflow/core/platform/status.h"
-#include "tensorflow/core/tpu/tpu_api_dlsym_set_fn.h"
-#include "tensorflow/core/tpu/tpu_api.h"
-#include "tensorflow/core/tpu/tpu_initializer_helper.h"
-#include "tensorflow/stream_executor/tpu/tpu_platform.h"
 
 namespace tensorflow {
 namespace tpu {
 namespace {
 #if !defined(PLATFORM_GOOGLE)
-#include "tensorflow/core/tpu/tpu_library_init_fns.inc"
+#include "xla/stream_executor/tpu/tpu_library_init_fns.inc"
 Status InitializeTpuLibrary(void* library_handle) {
   Status s = InitializeTpuStructFns(library_handle);
 
@@ -43,7 +43,7 @@ Status InitializeTpuLibrary(void* library_handle) {
     void (*initialize_fn)(bool init_library, int num_args, const char** args);
     initialize_fn = reinterpret_cast<decltype(initialize_fn)>(
         dlsym(library_handle, "TfTpu_Initialize"));
-    (*initialize_fn)(/*init_library=*/true, args.second.size(),
+    (*initialize_fn)(/*init_library=*/true, args.second.size() - 1,
                      args.second.data());
 
     RegisterTpuPlatform();
@@ -59,11 +59,14 @@ bool FindAndLoadTpuModelServer() {
   LOG(INFO) << "Libtpu path is: " << libtpu_path;
   void* library = dlopen(libtpu_path, RTLD_NOW);
   if (library) {
-    if (TryAcquireTpuLock()) {
-      InitializeTpuLibrary(library);
+    if (TryAcquireTpuLock().ok()) {
+      Status s = InitializeTpuLibrary(library);
+      if (!s.ok()) {
+        return false;
+      }
     }
   }
-  OpsApiFn()->TfTpu_InitializeTpuModelServerFn();
+  stream_executor::tpu::OpsApiFn()->TfTpu_InitializeTpuModelServerFn();
   return true;
 }
 

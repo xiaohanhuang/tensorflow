@@ -12,6 +12,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+#include <cstdint>
+
 #include "tensorflow/compiler/tf2xla/lib/broadcast.h"
 #include "tensorflow/compiler/tf2xla/lib/util.h"
 #include "tensorflow/compiler/tf2xla/shape_util.h"
@@ -19,13 +21,14 @@ limitations under the License.
 #include "tensorflow/compiler/tf2xla/xla_helpers.h"
 #include "tensorflow/compiler/tf2xla/xla_op_kernel.h"
 #include "tensorflow/compiler/tf2xla/xla_op_registry.h"
-#include "tensorflow/compiler/xla/client/lib/arithmetic.h"
-#include "tensorflow/compiler/xla/client/lib/constants.h"
-#include "tensorflow/compiler/xla/client/xla_builder.h"
-#include "tensorflow/compiler/xla/primitive_util.h"
-#include "tensorflow/compiler/xla/xla_data.pb.h"
+#include "xla/hlo/builder/lib/arithmetic.h"
+#include "xla/hlo/builder/lib/constants.h"
+#include "xla/hlo/builder/xla_builder.h"
+#include "xla/primitive_util.h"
+#include "xla/xla_data.pb.h"
 #include "tensorflow/core/framework/kernel_def_builder.h"
 #include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/lib/core/errors.h"
 
 namespace tensorflow {
@@ -57,17 +60,17 @@ class CastOp : public XlaOpKernel {
       output = xla::ConvertElementType(xla::Real(input), dst_type_);
     } else {
       if (use_truncation_) {
-        OP_REQUIRES(
-            ctx,
-            xla::primitive_util::IsFloatingPointType(src_type_) &&
-                xla::primitive_util::IsFloatingPointType(dst_type_),
-            errors::Unimplemented("Truncate attribute is only "
-                                  "implemented for floating point datatypes."));
+        OP_REQUIRES(ctx,
+                    xla::primitive_util::IsFloatingPointType(src_type_) &&
+                        xla::primitive_util::IsFloatingPointType(dst_type_),
+                    absl::UnimplementedError(
+                        "Truncate attribute is only "
+                        "implemented for floating point datatypes."));
         int mantissa_difference =
             xla::primitive_util::SignificandWidth(src_type_) -
             xla::primitive_util::SignificandWidth(dst_type_);
         OP_REQUIRES(ctx, mantissa_difference > 0,
-                    errors::Unimplemented(
+                    absl::UnimplementedError(
                         "Truncate attribute is only implemented in cases where "
                         "dst datatype "
                         "has fewer mantissa bits than the src datatype"));
@@ -79,7 +82,7 @@ class CastOp : public XlaOpKernel {
         xla::PrimitiveType same_width_int =
             xla::primitive_util::UnsignedIntegralTypeForBitWidth(src_bitwidth);
         OP_REQUIRES(ctx, same_width_int != xla::PRIMITIVE_TYPE_INVALID,
-                    errors::Unimplemented("Unexpected type bitwidth"));
+                    absl::UnimplementedError("Unexpected type bitwidth"));
         input = xla::BitcastConvertType(
             xla::And(
                 xla::BitcastConvertType(input, same_width_int),
@@ -97,7 +100,8 @@ class CastOp : public XlaOpKernel {
   xla::PrimitiveType src_type_, dst_type_;
   bool use_truncation_;
 
-  TF_DISALLOW_COPY_AND_ASSIGN(CastOp);
+  CastOp(const CastOp&) = delete;
+  void operator=(const CastOp&) = delete;
 };
 
 REGISTER_XLA_OP(Name("Cast"), CastOp);
@@ -125,14 +129,14 @@ class BitcastOp : public XlaOpKernel {
     OP_REQUIRES(ctx,
                 !xla::primitive_util::IsComplexType(src_type_) &&
                     !xla::primitive_util::IsComplexType(dst_type_),
-                errors::Unimplemented("Complex types not supported."));
+                absl::UnimplementedError("Complex types not supported."));
     auto input_bit_width = xla::primitive_util::BitWidth(src_type_);
     auto output_bit_width = xla::primitive_util::BitWidth(dst_type_);
 
     OP_REQUIRES(ctx,
                 output_bit_width % input_bit_width == 0 ||
                     input_bit_width % output_bit_width == 0,
-                errors::InvalidArgument(
+                absl::InvalidArgumentError(
                     "Neither bit width is a multiple of the other."));
     output = xla::BitcastConvertType(input, dst_type_);
     ctx->SetOutput(0, output);
@@ -142,7 +146,8 @@ class BitcastOp : public XlaOpKernel {
   DataType src_dtype_, dst_dtype_;
   xla::PrimitiveType src_type_, dst_type_;
 
-  TF_DISALLOW_COPY_AND_ASSIGN(BitcastOp);
+  BitcastOp(const BitcastOp&) = delete;
+  void operator=(const BitcastOp&) = delete;
 };
 
 REGISTER_XLA_OP(Name("Bitcast"), BitcastOp);

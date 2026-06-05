@@ -13,16 +13,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <cstdint>
+#include <utility>
+#include <vector>
+
 #include "tensorflow/compiler/tf2xla/kernels/conv_op_helpers.h"
 #include "tensorflow/compiler/tf2xla/type_util.h"
 #include "tensorflow/compiler/tf2xla/xla_helpers.h"
 #include "tensorflow/compiler/tf2xla/xla_op_kernel.h"
 #include "tensorflow/compiler/tf2xla/xla_op_registry.h"
-#include "tensorflow/compiler/xla/client/lib/constants.h"
-#include "tensorflow/compiler/xla/client/lib/matrix.h"
-#include "tensorflow/compiler/xla/client/xla_builder.h"
-#include "tensorflow/compiler/xla/shape_util.h"
-#include "tensorflow/compiler/xla/util.h"
+#include "xla/hlo/builder/lib/constants.h"
+#include "xla/hlo/builder/lib/matrix.h"
+#include "xla/hlo/builder/xla_builder.h"
+#include "xla/shape_util.h"
+#include "xla/util.h"
+#include "xla/xla_data.pb.h"
 #include "tensorflow/core/framework/kernel_shape_util.h"
 #include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/util/tensor_format.h"
@@ -44,61 +49,65 @@ class ExtractImagePatchesOp : public XlaOpKernel {
     const TensorFormat data_format = FORMAT_NHWC;
     const int num_dims = ksizes_.size();
 
-    OP_REQUIRES(
-        ctx, num_dims >= 3,
-        errors::InvalidArgument("Kernel size must have at least 3 dimensions"));
+    OP_REQUIRES(ctx, num_dims >= 3,
+                absl::InvalidArgumentError(
+                    "Kernel size must have at least 3 dimensions"));
     const int num_spatial_dims = num_dims - 2;
 
     OP_REQUIRES(ctx, strides_.size() == num_dims,
-                errors::InvalidArgument("Sliding window strides field must "
-                                        "specify ",
-                                        num_dims, " dimensions"));
-    OP_REQUIRES(ctx, dilations_.size() == num_dims,
-                errors::InvalidArgument("Dilations field must "
-                                        "specify ",
-                                        num_dims, " dimensions"));
+                absl::InvalidArgumentError(
+                    absl::StrCat("Sliding window strides field must "
+                                 "specify ",
+                                 num_dims, " dimensions")));
+    OP_REQUIRES(
+        ctx, dilations_.size() == num_dims,
+        absl::InvalidArgumentError(absl::StrCat("Dilations field must "
+                                                "specify ",
+                                                num_dims, " dimensions")));
 
     int batch_dim = GetTensorBatchDimIndex(num_dims, data_format);
     int feature_dim = GetTensorFeatureDimIndex(num_dims, data_format);
     OP_REQUIRES(
         ctx, ksizes_[batch_dim] == 1 && ksizes_[feature_dim] == 1,
-        errors::Unimplemented("Current implementation does not yet support "
-                              "kernel sizes > 1 in the batch and depth "
-                              "dimensions."));
+        absl::UnimplementedError("Current implementation does not yet support "
+                                 "kernel sizes > 1 in the batch and depth "
+                                 "dimensions."));
     OP_REQUIRES(
         ctx, strides_[batch_dim] == 1 && strides_[feature_dim] == 1,
-        errors::Unimplemented("Current implementation does not yet support "
-                              "strides in the batch and depth dimensions."));
-    OP_REQUIRES(
-        ctx, dilations_[batch_dim] == 1 && dilations_[feature_dim] == 1,
-        errors::Unimplemented("Current implementation does not support "
-                              "dilations in the batch and depth dimensions."));
+        absl::UnimplementedError("Current implementation does not yet support "
+                                 "strides in the batch and depth dimensions."));
+    OP_REQUIRES(ctx, dilations_[batch_dim] == 1 && dilations_[feature_dim] == 1,
+                absl::UnimplementedError(
+                    "Current implementation does not support "
+                    "dilations in the batch and depth dimensions."));
 
     for (int i = 0; i < num_spatial_dims; ++i) {
       int input_dim = GetTensorSpatialDimIndex(num_dims, data_format, i);
       OP_REQUIRES(
           ctx, ksizes_[input_dim] >= 0,
-          errors::Unimplemented("Kernel size values must be non-negative; ", i,
-                                "th spatial dimension had dilation ",
-                                dilations_[input_dim]));
-      OP_REQUIRES(ctx, strides_[input_dim] >= 1,
-                  errors::Unimplemented("Stride values must be positive; ", i,
-                                        "th spatial dimension had dilation ",
-                                        dilations_[input_dim]));
-      OP_REQUIRES(ctx, dilations_[input_dim] >= 1,
-                  errors::Unimplemented("Dilation values must be positive; ", i,
-                                        "th spatial dimension had dilation ",
-                                        dilations_[input_dim]));
+          absl::UnimplementedError(absl::StrCat(
+              "Kernel size values must be non-negative; ", i,
+              "th spatial dimension had dilation ", dilations_[input_dim])));
+      OP_REQUIRES(
+          ctx, strides_[input_dim] >= 1,
+          absl::UnimplementedError(absl::StrCat(
+              "Stride values must be positive; ", i,
+              "th spatial dimension had dilation ", dilations_[input_dim])));
+      OP_REQUIRES(
+          ctx, dilations_[input_dim] >= 1,
+          absl::UnimplementedError(absl::StrCat(
+              "Dilation values must be positive; ", i,
+              "th spatial dimension had dilation ", dilations_[input_dim])));
     }
 
     xla::PrimitiveType type;
     OP_REQUIRES_OK(ctx, DataTypeToPrimitiveType(ctx->input_type(0), &type));
 
     const TensorShape input_shape = ctx->InputShape(0);
-    OP_REQUIRES(
-        ctx, input_shape.dims() == num_dims,
-        errors::InvalidArgument("input must be ", num_dims, "-dimensional",
-                                input_shape.DebugString()));
+    OP_REQUIRES(ctx, input_shape.dims() == num_dims,
+                absl::InvalidArgumentError(
+                    absl::StrCat("input must be ", num_dims, "-dimensional",
+                                 input_shape.DebugString())));
     const int64_t depth = input_shape.dim_size(feature_dim);
 
     xla::XlaBuilder* builder = ctx->builder();
@@ -116,12 +125,17 @@ class ExtractImagePatchesOp : public XlaOpKernel {
     kernel_shape[num_spatial_dims + 1] = kernel_size * depth;
     xla::Shape iota_kernel_shape =
         xla::ShapeUtil::MakeShape(xla::S32, {kernel_size, depth, kernel_size});
-    xla::XlaOp filter =
-        xla::Reshape(xla::ConvertElementType(
-                         xla::Eq(xla::Iota(builder, iota_kernel_shape, 0),
-                                 xla::Iota(builder, iota_kernel_shape, 2)),
-                         type),
-                     kernel_shape);
+    xla::XlaOp pred_intermediate = xla::Eq(xla::Iota(builder, iota_kernel_shape,
+                                                     /* iota_dimension= */ 0),
+                                           xla::Iota(builder, iota_kernel_shape,
+                                                     /* iota_dimension= */ 2));
+    // In some cases TPU implementations give different results than CPU and GPU
+    // when doing the conversion directly from pred to the final type. Add an
+    // extra conversion to S32 here solves this.
+    xla::XlaOp int_intermediate =
+        xla::ConvertElementType(pred_intermediate, xla::S32);
+    xla::XlaOp filter = xla::Reshape(
+        xla::ConvertElementType(int_intermediate, type), kernel_shape);
 
     xla::ConvolutionDimensionNumbers dims;
     std::vector<int64_t> window_strides(num_spatial_dims);
@@ -146,7 +160,7 @@ class ExtractImagePatchesOp : public XlaOpKernel {
 
       int64_t unused_output_size;
       OP_REQUIRES_OK(
-          ctx, GetWindowedOutputSizeVerboseV2(
+          ctx, GetWindowedOutputSizeVerbose(
                    input_shape.dim_size(dim), ksizes_[dim], rhs_dilation[i],
                    window_strides[i], padding_, &unused_output_size,
                    &padding[i].first, &padding[i].second));
@@ -158,7 +172,7 @@ class ExtractImagePatchesOp : public XlaOpKernel {
     // Feature group convolution, will end up with the kernel_size change more
     // rapidly than the depth. Reshape, transpose and reshape to reorder them.
     std::vector<int64_t> conv_dims =
-        xla::SpanToVector(builder->GetShape(conv).ValueOrDie().dimensions());
+        xla::SpanToVector(builder->GetShape(conv).value().dimensions());
     conv_dims.back() = depth;
     conv_dims.push_back(kernel_size);
     conv = xla::TransposeInMinorDims(xla::Reshape(conv, conv_dims));
@@ -169,20 +183,19 @@ class ExtractImagePatchesOp : public XlaOpKernel {
   }
 
  protected:
-  std::vector<int32> ksizes_;
-  std::vector<int32> dilations_;
-  std::vector<int32> strides_;
+  std::vector<int32_t> ksizes_;
+  std::vector<int32_t> dilations_;
+  std::vector<int32_t> strides_;
   Padding padding_;
 
  private:
-  TF_DISALLOW_COPY_AND_ASSIGN(ExtractImagePatchesOp);
+  ExtractImagePatchesOp(const ExtractImagePatchesOp&) = delete;
+  void operator=(const ExtractImagePatchesOp&) = delete;
 };
 
-// We don't support integers for the convolution used in the implementation of
-// this op, so we limit the supported types.
-REGISTER_XLA_OP(
-    Name("ExtractImagePatches").TypeConstraint("T", GetXlaConvTypes()),
-    ExtractImagePatchesOp);
+// We don't support integers for the convolution for GPU used in the
+// implementation of this op, so we limit the supported types.
+REGISTER_XLA_CONV_OP(Name("ExtractImagePatches"), ExtractImagePatchesOp);
 
 }  // namespace
 }  // namespace tensorflow

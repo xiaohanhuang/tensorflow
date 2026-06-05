@@ -24,9 +24,11 @@ limitations under the License.
 // Above is the related header but clang tidy doesn't recognize it.
 #include "tensorflow/core/framework/numeric_op.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/monitoring/gauge.h"
 #include "tensorflow/core/platform/protobuf.h"
+#include "tensorflow/core/util/determinism.h"
 
 using tensorflow::BinaryElementWiseOp;
 using tensorflow::DEVICE_CPU;
@@ -69,14 +71,15 @@ class FakeQuantWithMinMaxArgsOp
       : Base::UnaryElementWiseOp(context) {
     OP_REQUIRES_OK(context, context->GetAttr("min", &min_));
     OP_REQUIRES_OK(context, context->GetAttr("max", &max_));
-    OP_REQUIRES(context, min_ < max_,
-                InvalidArgument("min has to be smaller than max, was: ", min_,
-                                " >= ", max_));
+    OP_REQUIRES(
+        context, min_ < max_,
+        absl::InvalidArgumentError(absl::StrCat(
+            "min has to be smaller than max, was: ", min_, " >= ", max_)));
     int num_bits;
     OP_REQUIRES_OK(context, context->GetAttr("num_bits", &num_bits));
-    OP_REQUIRES(
-        context, IsNumBitsValid(num_bits),
-        InvalidArgument("num_bits must be between 2 and 16, inclusive"));
+    OP_REQUIRES(context, IsNumBitsValid(num_bits),
+                absl::InvalidArgumentError(
+                    "num_bits must be between 2 and 16, inclusive"));
     bool narrow_range;
     OP_REQUIRES_OK(context, context->GetAttr("narrow_range", &narrow_range));
     quant_min_ = narrow_range ? 1 : 0;
@@ -110,14 +113,15 @@ class FakeQuantWithMinMaxArgsGradientOp
       : Base::BinaryElementWiseOp(context) {
     OP_REQUIRES_OK(context, context->GetAttr("min", &min_));
     OP_REQUIRES_OK(context, context->GetAttr("max", &max_));
-    OP_REQUIRES(context, min_ < max_,
-                InvalidArgument("min has to be smaller than max, was: ", min_,
-                                " >= ", max_));
+    OP_REQUIRES(
+        context, min_ < max_,
+        absl::InvalidArgumentError(absl::StrCat(
+            "min has to be smaller than max, was: ", min_, " >= ", max_)));
     int num_bits;
     OP_REQUIRES_OK(context, context->GetAttr("num_bits", &num_bits));
-    OP_REQUIRES(
-        context, IsNumBitsValid(num_bits),
-        InvalidArgument("num_bits must be between 2 and 16, inclusive"));
+    OP_REQUIRES(context, IsNumBitsValid(num_bits),
+                absl::InvalidArgumentError(
+                    "num_bits must be between 2 and 16, inclusive"));
     bool narrow_range;
     OP_REQUIRES_OK(context, context->GetAttr("narrow_range", &narrow_range));
     quant_min_ = narrow_range ? 1 : 0;
@@ -132,8 +136,9 @@ class FakeQuantWithMinMaxArgsGradientOp
 
   void OperateNoTemplate(OpKernelContext* context, const Tensor& gradient,
                          const Tensor& input, Tensor* output) {
-    OP_REQUIRES(context, input.IsSameSize(gradient),
-                InvalidArgument("gradient and input must be the same size"));
+    OP_REQUIRES(
+        context, input.IsSameSize(gradient),
+        absl::InvalidArgumentError("gradient and input must be the same size"));
     FakeQuantWithMinMaxArgsGradientFunctor<Device> functor;
     functor(context->eigen_device<Device>(), gradient.flat<float>(),
             input.flat<float>(), min_, max_, quant_min_, quant_max_,
@@ -188,9 +193,9 @@ class FakeQuantWithMinMaxVarsOp : public OpKernel {
       : OpKernel::OpKernel(context) {
     int num_bits;
     OP_REQUIRES_OK(context, context->GetAttr("num_bits", &num_bits));
-    OP_REQUIRES(
-        context, IsNumBitsValid(num_bits),
-        InvalidArgument("num_bits must be between 2 and 16, inclusive"));
+    OP_REQUIRES(context, IsNumBitsValid(num_bits),
+                absl::InvalidArgumentError(
+                    "num_bits must be between 2 and 16, inclusive"));
     bool narrow_range;
     OP_REQUIRES_OK(context, context->GetAttr("narrow_range", &narrow_range));
     quant_min_ = narrow_range ? 1 : 0;
@@ -203,6 +208,13 @@ class FakeQuantWithMinMaxVarsOp : public OpKernel {
     const Tensor& input = context->input(0);
     const Tensor& min = context->input(1);
     const Tensor& max = context->input(2);
+
+    OP_REQUIRES(context, TensorShapeUtils::IsScalar(min.shape()),
+                absl::InvalidArgumentError(absl::StrCat(
+                    "`min` must be rank 0 but is rank ", min.dims())));
+    OP_REQUIRES(context, TensorShapeUtils::IsScalar(max.shape()),
+                absl::InvalidArgumentError(absl::StrCat(
+                    "`max` must be rank 0 but is rank ", max.dims())));
 
     Tensor* output;
     OP_REQUIRES_OK(context,
@@ -228,23 +240,37 @@ class FakeQuantWithMinMaxVarsGradientOp : public OpKernel {
       : OpKernel::OpKernel(context) {
     int num_bits;
     OP_REQUIRES_OK(context, context->GetAttr("num_bits", &num_bits));
-    OP_REQUIRES(
-        context, IsNumBitsValid(num_bits),
-        InvalidArgument("num_bits must be between 2 and 16, inclusive"));
+    OP_REQUIRES(context, IsNumBitsValid(num_bits),
+                absl::InvalidArgumentError(
+                    "num_bits must be between 2 and 16, inclusive"));
     bool narrow_range;
     OP_REQUIRES_OK(context, context->GetAttr("narrow_range", &narrow_range));
     quant_min_ = narrow_range ? 1 : 0;
     quant_max_ = (1 << num_bits) - 1;
+    if (std::is_same<Device, Eigen::GpuDevice>::value) {
+      OP_REQUIRES(
+          context, !OpDeterminismRequired(),
+          absl::UnimplementedError(
+              "Determinism is not yet supported in GPU implementation of "
+              "FakeQuantWithMinMaxVarsGradient."));
+    }
   }
 
   void Compute(OpKernelContext* context) override {
     CHECK_EQ(4, context->num_inputs());
     const Tensor& gradient = context->input(0);
     const Tensor& input = context->input(1);
-    OP_REQUIRES(context, input.IsSameSize(gradient),
-                InvalidArgument("gradient and input must be the same size"));
+    OP_REQUIRES(
+        context, input.IsSameSize(gradient),
+        absl::InvalidArgumentError("gradient and input must be the same size"));
     const Tensor& min = context->input(2);
     const Tensor& max = context->input(3);
+    OP_REQUIRES(context, TensorShapeUtils::IsScalar(min.shape()),
+                absl::InvalidArgumentError(absl::StrCat(
+                    "`min` must be rank 0 but is rank ", min.dims())));
+    OP_REQUIRES(context, TensorShapeUtils::IsScalar(max.shape()),
+                absl::InvalidArgumentError(absl::StrCat(
+                    "`max` must be rank 0 but is rank ", max.dims())));
 
     Tensor* grad_wrt_input;
     OP_REQUIRES_OK(context,
@@ -319,9 +345,9 @@ class FakeQuantWithMinMaxVarsPerChannelOp : public OpKernel {
       : OpKernel::OpKernel(context) {
     int num_bits;
     OP_REQUIRES_OK(context, context->GetAttr("num_bits", &num_bits));
-    OP_REQUIRES(
-        context, IsNumBitsValid(num_bits),
-        InvalidArgument("num_bits must be between 2 and 16, inclusive"));
+    OP_REQUIRES(context, IsNumBitsValid(num_bits),
+                absl::InvalidArgumentError(
+                    "num_bits must be between 2 and 16, inclusive"));
     bool narrow_range;
     OP_REQUIRES_OK(context, context->GetAttr("narrow_range", &narrow_range));
     quant_min_ = narrow_range ? 1 : 0;
@@ -334,13 +360,22 @@ class FakeQuantWithMinMaxVarsPerChannelOp : public OpKernel {
     const Tensor& input = context->input(0);
     const int depth = input.dim_size(input.dims() - 1);  // last dimension size.
     const Tensor& min = context->input(1);
-    OP_REQUIRES(context, min.dim_size(0) == depth,
-                InvalidArgument("min has incorrect size, expected ", depth,
-                                " was ", min.dim_size(0)));
     const Tensor& max = context->input(2);
+
+    OP_REQUIRES(context, TensorShapeUtils::IsVector(min.shape()),
+                absl::InvalidArgumentError(absl::StrCat(
+                    "`min` must be rank 1 but is rank ", min.dims())));
+    OP_REQUIRES(context, min.dim_size(0) == depth,
+                absl::InvalidArgumentError(
+                    absl::StrCat("min has incorrect size, expected ", depth,
+                                 " was ", min.dim_size(0))));
+    OP_REQUIRES(context, TensorShapeUtils::IsVector(max.shape()),
+                absl::InvalidArgumentError(absl::StrCat(
+                    "`max` must be rank 1 but is rank ", max.dims())));
     OP_REQUIRES(context, max.dim_size(0) == depth,
-                InvalidArgument("max has incorrect size, expected ", depth,
-                                " was ", max.dim_size(0)));
+                absl::InvalidArgumentError(
+                    absl::StrCat("max has incorrect size, expected ", depth,
+                                 " was ", max.dim_size(0))));
 
     Tensor* output;
     OP_REQUIRES_OK(context,
@@ -367,30 +402,46 @@ class FakeQuantWithMinMaxVarsPerChannelGradientOp : public OpKernel {
       : OpKernel::OpKernel(context) {
     int num_bits;
     OP_REQUIRES_OK(context, context->GetAttr("num_bits", &num_bits));
-    OP_REQUIRES(
-        context, IsNumBitsValid(num_bits),
-        InvalidArgument("num_bits must be between 2 and 16, inclusive"));
+    OP_REQUIRES(context, IsNumBitsValid(num_bits),
+                absl::InvalidArgumentError(
+                    "num_bits must be between 2 and 16, inclusive"));
     bool narrow_range;
     OP_REQUIRES_OK(context, context->GetAttr("narrow_range", &narrow_range));
     quant_min_ = narrow_range ? 1 : 0;
     quant_max_ = (1 << num_bits) - 1;
+    if (std::is_same<Device, Eigen::GpuDevice>::value) {
+      OP_REQUIRES(
+          context, !OpDeterminismRequired(),
+          absl::UnimplementedError(
+              "Determinism is not yet supported in GPU implementation of "
+              "FakeQuantWithMinMaxVarsPerChannelGradient."));
+    }
   }
 
   void Compute(OpKernelContext* context) override {
     CHECK_EQ(4, context->num_inputs());
     const Tensor& gradient = context->input(0);
     const Tensor& input = context->input(1);
-    OP_REQUIRES(context, input.IsSameSize(gradient),
-                InvalidArgument("gradient and input must be the same size"));
+    OP_REQUIRES(
+        context, input.IsSameSize(gradient),
+        absl::InvalidArgumentError("gradient and input must be the same size"));
     const int depth = input.dim_size(input.dims() - 1);  // last dimension size.
     const Tensor& min = context->input(2);
+    OP_REQUIRES(context, TensorShapeUtils::IsVector(min.shape()),
+                absl::InvalidArgumentError(absl::StrCat(
+                    "`min` must be rank 1 but is rank ", min.dims())));
     OP_REQUIRES(context, min.dim_size(0) == depth,
-                InvalidArgument("min has incorrect size, expected ", depth,
-                                " was ", min.dim_size(0)));
+                absl::InvalidArgumentError(
+                    absl::StrCat("min has incorrect size, expected ", depth,
+                                 " was ", min.dim_size(0))));
     const Tensor& max = context->input(3);
+    OP_REQUIRES(context, TensorShapeUtils::IsVector(max.shape()),
+                absl::InvalidArgumentError(absl::StrCat(
+                    "`max` must be rank 1 but is rank ", max.dims())));
     OP_REQUIRES(context, max.dim_size(0) == depth,
-                InvalidArgument("max has incorrect size, expected ", depth,
-                                " was ", max.dim_size(0)));
+                absl::InvalidArgumentError(
+                    absl::StrCat("max has incorrect size, expected ", depth,
+                                 " was ", max.dim_size(0))));
 
     Tensor* grad_wrt_input;
     OP_REQUIRES_OK(context,

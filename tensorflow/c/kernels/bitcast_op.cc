@@ -13,8 +13,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <sstream>
 
+#include "absl/log/check.h"
 #include "tensorflow/c/kernels.h"
 #include "tensorflow/c/ops.h"
 #include "tensorflow/c/tf_tensor.h"
@@ -92,7 +96,7 @@ static void BitcastOp_Compute(void* kernel, TF_OpKernelContext* ctx) {
   auto* k = static_cast<BitcastOp*>(kernel);
   int dim_count = 0;
 
-  TF_Tensor* tensor;
+  TF_Tensor* tensor = nullptr;
   TF_Status* status = TF_NewStatus();
   TF_GetInput(ctx, 0, &tensor, status);
   if (TF_GetCode(status) == TF_OK) {

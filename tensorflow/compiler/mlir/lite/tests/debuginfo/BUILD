@@ -1,9 +1,14 @@
-load("//tensorflow:tensorflow.bzl", "filegroup")
+load("@xla//third_party/rules_python/python:py_binary.bzl", "py_binary")
+load("//tensorflow:tensorflow.bzl", "if_oss")
+load("//tensorflow:tensorflow.default.bzl", "filegroup")
 load("//tensorflow/compiler/mlir:glob_lit_test.bzl", "glob_lit_tests")
+
+# copybara:uncomment package(default_applicable_licenses = ["//tensorflow:LICENSE"])
 
 licenses(["notice"])
 
 glob_lit_tests(
+    name = "all_tests",
     data = [
         ":debug_info_files",
         ":test_utilities",
@@ -40,8 +45,15 @@ filegroup(
 py_binary(
     name = "saved_model_error",
     srcs = ["saved_model_error.py"],
+    exec_properties = if_oss(
+        None,
+        select({
+            "@bazel_tools//tools/cpp:asan_build": {"cpp_link.mem": "20g"},
+            "//conditions:default": None,
+        }),
+    ),
     main = "saved_model_error.py",
-    python_version = "PY3",
+    strict_deps = True,
     deps = [
         "//tensorflow:tensorflow_py",
         "@absl_py//absl:app",
@@ -51,8 +63,15 @@ py_binary(
 py_binary(
     name = "concrete_function_error",
     srcs = ["concrete_function_error.py"],
+    exec_properties = if_oss(
+        None,
+        select({
+            "@bazel_tools//tools/cpp:asan_build": {"cpp_link.mem": "20g"},
+            "//conditions:default": None,
+        }),
+    ),
     main = "concrete_function_error.py",
-    python_version = "PY3",
+    strict_deps = True,
     deps = [
         "//tensorflow:tensorflow_py",
         "@absl_py//absl:app",

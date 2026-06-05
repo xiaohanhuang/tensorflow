@@ -14,14 +14,26 @@ limitations under the License.
 ==============================================================================*/
 #include <cstdint>
 #include <initializer_list>
+#include <memory>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "tensorflow/lite/c/common.h"
+#include "tensorflow/lite/kernels/kernel_util.h"
 #include "tensorflow/lite/kernels/test_util.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 
 namespace tflite {
+
+namespace ops {
+namespace builtin {
+
+TfLiteRegistration* Register_CONV_3D_GENERIC_OPT();
+
+}  // namespace builtin
+}  // namespace ops
+
 namespace {
 
 using ::testing::ElementsAre;
@@ -84,6 +96,39 @@ class Conv3dOpModel : public SingleOpModel {
   int output_;
 };
 
+class PrepareOnlyConv3dOpModel : public SingleOpModel {
+ public:
+  PrepareOnlyConv3dOpModel(
+      const TensorData& input, const TensorData& filter,
+      const TensorData& output, Padding padding = Padding_VALID,
+      int32_t stride_depth = 1, int32_t stride_width = 1,
+      int32_t stride_height = 1,
+      ActivationFunctionType activation = ActivationFunctionType_NONE,
+      int32_t dilation_depth = 1, int32_t dilation_width = 1,
+      int32_t dilation_height = 1) {
+    input_ = AddInput(input);
+    filter_ = AddInput(filter);
+    output_ = AddOutput(output);
+    SetBuiltinOp(
+        BuiltinOperator_CONV_3D, BuiltinOptions_Conv3DOptions,
+        CreateConv3DOptions(builder_, padding, stride_depth, stride_width,
+                            stride_height, activation, dilation_depth,
+                            dilation_width, dilation_height)
+            .Union());
+    resolver_ = std::make_unique<SingleOpResolver>(
+        BuiltinOperator_CONV_3D, ops::builtin::Register_CONV_3D_GENERIC_OPT());
+    BuildInterpreter({GetShape(input_), GetShape(filter_)},
+                     /*num_threads=*/1, /*allow_fp32_relax_to_fp16=*/false,
+                     /*apply_delegate=*/false,
+                     /*allocate_and_delegate=*/false);
+  }
+
+ private:
+  int input_;
+  int filter_;
+  int output_;
+};
+
 template <typename T>
 std::vector<T> CreateRangeVector(int N) {
   std::vector<T> result;
@@ -122,6 +167,28 @@ TEST(Conv3dOpModel, MismatchBiasSizeTest) {
       "NumElements.bias. != SizeOfDimension.filter, 4.");
 }
 
+TEST(Conv3dPrepareSecurityTest, RejectsIm2ColDepthOverflow) {
+  if (sizeof(void*) <= 4) {
+    GTEST_SKIP() << "Interpreter construction overflows before kernel Prepare "
+                    "on 32-bit.";
+  }
+  constexpr int kHugeDim = 46341;
+  PrepareOnlyConv3dOpModel m(
+      {TensorType_FLOAT32, {1, 1, 1, 1, kHugeDim}},
+      {TensorType_FLOAT32, {kHugeDim, 1, 1, kHugeDim, 1}},
+      {TensorType_FLOAT32, {}}, Padding_SAME);
+
+  // On non-mobile platforms, need_im2col is always true, so the overflow is
+  // detected and the allocation is rejected, resulting in kTfLiteError.
+  // On mobile platforms, it goes to a fallback execution path that does not
+  // require im2col, thus does not overflow and returns kTfLiteOk.
+  if (IsMobilePlatform()) {
+    EXPECT_EQ(m.AllocateTensors(), kTfLiteOk);
+  } else {
+    EXPECT_EQ(m.AllocateTensors(), kTfLiteError);
+  }
+}
+
 TEST(Conv3dOpModel, SimpleFloat32Test) {
   Conv3dOpModel m({TensorType_FLOAT32, {1, 2, 2, 4, 2}},
                   {TensorType_FLOAT32, {2, 2, 2, 2, 2}},
@@ -130,7 +197,7 @@ TEST(Conv3dOpModel, SimpleFloat32Test) {
   m.SetInput(CreateRangeVector<float>(32));
   m.SetFilter({-1, -1, -1, -1, -1, 1, -1, 1, -1, 1,  1,  1, 1, 1,  -1, -1,
                1,  -1, 1,  1,  1,  1, -1, 1, -1, -1, -1, 1, 1, -1, 1,  -1});
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutputShape(), ElementsAre(1, 1, 1, 3, 2));
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({30, 6, 26, 10, 22, 14}));
@@ -144,7 +211,7 @@ TEST(Conv3dOpModel, PaddingValidTest) {
   m.SetInput(CreateRangeVector<float>(120));
   m.SetFilter({-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 1, 1,  1, -1, -1,
                1,  1,  -1, 1,  -1, 1,  -1, 1,  -1, -1, -1, 1, -1, 1, 1,  1});
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutputShape(), ElementsAre(1, 2, 3, 4, 2));
   EXPECT_THAT(
@@ -164,7 +231,7 @@ TEST(Conv3dOpModel, PaddingSameTest) {
   m.SetInput(CreateRangeVector<float>(120));
   m.SetFilter({1,  -1, 1,  -1, 1,  -1, -1, 1, 1, -1, -1, 1, 1,  -1, -1, 1,
                -1, 1,  -1, 1,  -1, -1, -1, 1, 1, 1,  1,  1, -1, 1,  -1, 1});
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutputShape(), ElementsAre(1, 3, 4, 5, 2));
   EXPECT_THAT(
@@ -192,7 +259,7 @@ TEST(Conv3dOpModel, StrideTest) {
   m.SetInput(CreateRangeVector<float>(96));
   m.SetFilter({1, -1, 1, 1, -1, 1, 1, -1, 1, -1, -1, -1, -1, 1, 1, 1,
                1, -1, 1, 1, -1, 1, 1, -1, 1, -1, -1, -1, -1, 1, 1, 1});
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutputShape(), ElementsAre(2, 1, 1, 2, 2));
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({52, 8, 68, 8, 244, 8, 260, 8}));
@@ -207,7 +274,7 @@ TEST(Conv3dOpModel, StrideAndPaddingSameTest) {
   m.SetInput(CreateRangeVector<float>(96));
   m.SetFilter({-1, 1, -1, 1,  1,  1,  1,  1,  -1, 1, -1, -1, -1, 1,  1,  1,
                1,  1, -1, -1, -1, -1, -1, -1, 1,  1, 1,  -1, -1, -1, -1, 1});
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutputShape(), ElementsAre(2, 1, 2, 2, 2));
   EXPECT_THAT(m.GetOutput(),
@@ -226,7 +293,7 @@ TEST(Conv3dOpModel, DilationTest) {
 
   m.SetInput(CreateRangeVector<float>(96));
   m.SetFilter(CreateRangeVector<float>(32));
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutputShape(), ElementsAre(2, 1, 1, 3, 2));
   EXPECT_THAT(m.GetOutput(),
@@ -245,7 +312,7 @@ TEST(Conv3dOpModel, BiasTest) {
   m.SetFilter({1, -1, 1, 1, -1, 1, 1, -1, 1, -1, -1, -1, -1, 1, 1, 1,
                1, -1, 1, 1, -1, 1, 1, -1, 1, -1, -1, -1, -1, 1, 1, 1});
   m.SetBias({1, 2});
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutputShape(), ElementsAre(2, 1, 1, 2, 2));
   EXPECT_THAT(m.GetOutput(),
@@ -259,7 +326,7 @@ TEST(Conv3dOpModel, NoIm2ColTensorTest) {
 
   m.SetInput(CreateRangeVector<float>(32));
   m.SetFilter(CreateRangeVector<float>(16));
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutputShape(), ElementsAre(1, 2, 2, 2, 4));
   EXPECT_THAT(

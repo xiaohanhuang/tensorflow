@@ -15,17 +15,22 @@ limitations under the License.
 
 // XLA implementations of Categorical op.
 
+#include <array>
+#include <cstdint>
+#include <string>
+
+#include "absl/log/log.h"
 #include "tensorflow/compiler/tf2xla/kernels/random_ops_util.h"
 #include "tensorflow/compiler/tf2xla/shape_util.h"
 #include "tensorflow/compiler/tf2xla/type_util.h"
 #include "tensorflow/compiler/tf2xla/xla_helpers.h"
 #include "tensorflow/compiler/tf2xla/xla_op_kernel.h"
 #include "tensorflow/compiler/tf2xla/xla_op_registry.h"
-#include "tensorflow/compiler/xla/client/lib/arithmetic.h"
-#include "tensorflow/compiler/xla/client/lib/constants.h"
-#include "tensorflow/compiler/xla/client/lib/prng.h"
-#include "tensorflow/compiler/xla/client/xla_builder.h"
-#include "tensorflow/compiler/xla/xla_data.pb.h"
+#include "xla/hlo/builder/lib/arithmetic.h"
+#include "xla/hlo/builder/lib/constants.h"
+#include "xla/hlo/builder/lib/prng.h"
+#include "xla/hlo/builder/xla_builder.h"
+#include "xla/xla_data.pb.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_shape.h"
@@ -36,9 +41,7 @@ namespace {
 
 class CategoricalOp : public XlaOpKernel {
  public:
-  explicit CategoricalOp(OpKernelConstruction* ctx)
-      : XlaOpKernel(ctx),
-        is_gpu_(ctx->device_type().type_string() == DEVICE_GPU_XLA_JIT) {}
+  explicit CategoricalOp(OpKernelConstruction* ctx) : XlaOpKernel(ctx) {}
 
   void Compile(XlaOpKernelContext* ctx) override {
     // Get the logits
@@ -49,18 +52,19 @@ class CategoricalOp : public XlaOpKernel {
                    ctx->ConstantInputAsIntScalar(
                        1, &num_samples, xla::ValueInferenceMode::kUpperBound));
     OP_REQUIRES(ctx, TensorShapeUtils::IsMatrix(logits_shape),
-                errors::InvalidArgument("logits should be a matrix, got shape ",
-                                        logits_shape.DebugString()));
+                absl::InvalidArgumentError(
+                    absl::StrCat("logits should be a matrix, got shape ",
+                                 logits_shape.DebugString())));
     OP_REQUIRES(ctx, num_samples >= 0,
-                errors::InvalidArgument(
-                    "num_samples should be nonnegative, got ", num_samples));
+                absl::InvalidArgumentError(absl::StrCat(
+                    "num_samples should be nonnegative, got ", num_samples)));
 
     for (int i = 0; i < 2; i++) {
       const int64_t dim = logits_shape.dim_size(i);
-      OP_REQUIRES(
-          ctx, static_cast<int>(dim) == dim,
-          errors::InvalidArgument("logits.shape = ", logits_shape.DebugString(),
-                                  " too large for int"));
+      OP_REQUIRES(ctx, static_cast<int>(dim) == dim,
+                  absl::InvalidArgumentError(absl::StrCat(
+                      "logits.shape = ", logits_shape.DebugString(),
+                      " too large for int")));
     }
 
     const int64_t batch_size = logits_shape.dim_size(0);
@@ -113,14 +117,8 @@ class CategoricalOp : public XlaOpKernel {
     xla::PrimitiveType xla_output_type;
     OP_REQUIRES_OK(ctx,
                    DataTypeToPrimitiveType(output_type(0), &xla_output_type));
-    xla::XlaOp argmax;
-    if (is_gpu_) {
-      argmax = xla::ArgMaxTwoPass(softmax_entries, xla_output_type,
-                                  /*axis=*/class_dimension);
-    } else {
-      argmax = xla::ArgMax(softmax_entries, xla_output_type,
-                           /*axis=*/class_dimension, /*stable=*/true);
-    }
+    xla::XlaOp argmax = xla::ArgMax(softmax_entries, xla_output_type,
+                                    /*axis=*/class_dimension);
 
     if (num_samples == 1 && !num_samples_is_dynamic) {
       argmax = xla::Reshape(argmax, {batch_size, 1});
@@ -145,8 +143,8 @@ class CategoricalOp : public XlaOpKernel {
   }
 
  private:
-  bool is_gpu_;
-  TF_DISALLOW_COPY_AND_ASSIGN(CategoricalOp);
+  CategoricalOp(const CategoricalOp&) = delete;
+  void operator=(const CategoricalOp&) = delete;
 };
 
 // TODO(b/68769717): Rename this sampler to Categorical.
@@ -181,17 +179,19 @@ class StatelessCategoricalOp : public CategoricalOp {
 
   void Compile(XlaOpKernelContext* ctx) override {
     TensorShape seed_shape = ctx->InputShape(2);
-    OP_REQUIRES(ctx, seed_shape.dims() == 1 && seed_shape.dim_size(0) == 2,
-                errors::InvalidArgument("seed must have shape [2], not ",
-                                        seed_shape.DebugString()));
+    OP_REQUIRES(
+        ctx, seed_shape.dims() == 1 && seed_shape.dim_size(0) == 2,
+        absl::InvalidArgumentError(absl::StrCat(
+            "seed must have shape [2], not ", seed_shape.DebugString())));
     CategoricalOp::Compile(ctx);
   }
 
  private:
   DataType dtype_;
-  string device_type_string_;
+  std::string device_type_string_;
 
-  TF_DISALLOW_COPY_AND_ASSIGN(StatelessCategoricalOp);
+  StatelessCategoricalOp(const StatelessCategoricalOp&) = delete;
+  void operator=(const StatelessCategoricalOp&) = delete;
 };
 
 REGISTER_XLA_OP(Name("StatelessMultinomial")

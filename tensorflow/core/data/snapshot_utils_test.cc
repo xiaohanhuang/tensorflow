@@ -15,6 +15,12 @@ limitations under the License.
 
 #include "tensorflow/core/data/snapshot_utils.h"
 
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "absl/status/status.h"
+#include "tensorflow/core/data/service/test_util.h"
 #include "tensorflow/core/framework/tensor.pb.h"
 #include "tensorflow/core/lib/core/status_test_util.h"
 #include "tensorflow/core/lib/io/compression.h"
@@ -27,6 +33,9 @@ namespace tensorflow {
 namespace data {
 namespace snapshot_util {
 namespace {
+
+using ::tensorflow::data::testing::EqualsProto;
+using ::tensorflow::data::testing::LocalTempFilename;
 
 void GenerateTensorVector(tensorflow::DataTypeVector& dtypes,
                           std::vector<Tensor>& tensors) {
@@ -89,6 +98,56 @@ TEST(SnapshotUtilTest, CombinationRoundTripTest) {
   SnapshotRoundTrip(io::compression::kNone, 2);
   SnapshotRoundTrip(io::compression::kGzip, 2);
   SnapshotRoundTrip(io::compression::kSnappy, 2);
+}
+
+TEST(SnapshotUtilTest, MetadataFileRoundTrip) {
+  experimental::DistributedSnapshotMetadata metadata_in;
+  metadata_in.set_compression(io::compression::kGzip);
+  std::string dir = LocalTempFilename();
+  TF_ASSERT_OK(WriteMetadataFile(Env::Default(), dir, &metadata_in));
+
+  experimental::DistributedSnapshotMetadata metadata_out;
+  bool file_exists;
+  TF_ASSERT_OK(
+      ReadMetadataFile(Env::Default(), dir, &metadata_out, &file_exists));
+  EXPECT_THAT(metadata_in, EqualsProto(metadata_out));
+}
+
+TEST(SnapshotUtilTest, MetadataFileDoesntExist) {
+  experimental::DistributedSnapshotMetadata metadata;
+  bool file_exists;
+  TF_ASSERT_OK(ReadMetadataFile(Env::Default(), LocalTempFilename(), &metadata,
+                                &file_exists));
+  EXPECT_FALSE(file_exists);
+}
+
+TEST(SnapshotUtilTest, SnappyTensorSizeMismatch) {
+  // Generate ground-truth tensors for writing and reading.
+  std::vector<Tensor> tensors;
+  tensorflow::DataTypeVector dtypes;
+  GenerateTensorVector(dtypes, tensors);
+
+  std::string filename;
+  EXPECT_TRUE(Env::Default()->LocalTempFilename(&filename));
+
+  std::unique_ptr<Writer> writer;
+  TF_ASSERT_OK(Writer::Create(tensorflow::Env::Default(), filename,
+                              io::compression::kSnappy, 1, dtypes, &writer));
+
+  TF_ASSERT_OK(writer->WriteTensors(tensors));
+  TF_ASSERT_OK(writer->Close());
+
+  std::unique_ptr<Reader> reader;
+  tensorflow::DataTypeVector wrong_dtypes = dtypes;
+  wrong_dtypes.push_back(DT_INT64);
+  TF_ASSERT_OK(Reader::Create(Env::Default(), filename,
+                              io::compression::kSnappy, 1, wrong_dtypes,
+                              &reader));
+
+  std::vector<Tensor> read_tensors;
+  EXPECT_TRUE(absl::IsDataLoss(reader->ReadTensors(&read_tensors)));
+
+  TF_ASSERT_OK(Env::Default()->DeleteFile(filename));
 }
 
 void SnapshotReaderBenchmarkLoop(::testing::benchmark::State& state,

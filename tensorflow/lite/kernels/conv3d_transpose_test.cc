@@ -14,10 +14,13 @@ limitations under the License.
 ==============================================================================*/
 #include <cstdint>
 #include <initializer_list>
+#include <memory>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "tensorflow/lite/c/common.h"
+#include "tensorflow/lite/core/kernels/builtin_op_kernels.h"
 #include "tensorflow/lite/kernels/test_util.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 
@@ -112,6 +115,43 @@ class Conv3dTransposeOpModel : public SingleOpModel {
   int output_;
 };
 
+class PrepareOnlyConv3dTransposeOpModel : public SingleOpModel {
+ public:
+  PrepareOnlyConv3dTransposeOpModel(
+      std::initializer_list<int> output_shape_data, const TensorData& filter,
+      const TensorData& input, const TensorData& output,
+      Padding padding = Padding_VALID, int32_t stride_depth = 1,
+      int32_t stride_width = 1, int32_t stride_height = 1,
+      ActivationFunctionType activation = ActivationFunctionType_NONE,
+      int32_t dilation_depth = 1, int32_t dilation_width = 1,
+      int32_t dilation_height = 1) {
+    output_shape_ = AddConstInput(TensorType_INT32, output_shape_data, {5});
+    filter_ = AddInput(filter);
+    input_ = AddInput(input);
+    output_ = AddOutput(output);
+    SetBuiltinOp(
+        BuiltinOperator_CONV_3D_TRANSPOSE, BuiltinOptions_Conv3DOptions,
+        CreateConv3DOptions(builder_, padding, stride_depth, stride_width,
+                            stride_height, activation, dilation_depth,
+                            dilation_width, dilation_height)
+            .Union());
+    resolver_ = std::make_unique<SingleOpResolver>(
+        BuiltinOperator_CONV_3D_TRANSPOSE,
+        ops::builtin::Register_CONV_3D_TRANSPOSE());
+    BuildInterpreter(
+        {GetShape(output_shape_), GetShape(filter_), GetShape(input_)},
+        /*num_threads=*/1, /*allow_fp32_relax_to_fp16=*/false,
+        /*apply_delegate=*/false,
+        /*allocate_and_delegate=*/false);
+  }
+
+ private:
+  int output_shape_;
+  int input_;
+  int filter_;
+  int output_;
+};
+
 template <typename T>
 std::vector<T> CreateRangeVector(int N) {
   std::vector<T> result;
@@ -154,7 +194,30 @@ TEST_P(Conv3dTransposeOpTest, MismatchBiasSizeTest) {
           {1, 2, 3, 4, 5}, {TensorType_FLOAT32, {1, 3, 2, 2, 2}},
           {TensorType_FLOAT32, {1, 2, 2, 4, 2}}, {TensorType_FLOAT32, {3}},
           {TensorType_FLOAT32, {}}, Conv3dTransposeOpTest::GetParam()),
-      "NumElements.bias. != SizeOfDimension.filter, 4.");
+      "NumElements.bias. != SizeOfDimension.filter, 3.");
+}
+
+TEST(Conv3dTransposePrepareSecurityTest, RejectsCol2ImOverflow) {
+  if (sizeof(void*) <= 4) {
+    GTEST_SKIP() << "Interpreter construction overflows before kernel Prepare "
+                    "on 32-bit.";
+  }
+  constexpr int kHugeDim = 46341;
+  PrepareOnlyConv3dTransposeOpModel m(
+      {1, 1, 1, 1, 0}, {TensorType_FLOAT32, {1, kHugeDim, kHugeDim, 1, 0}},
+      {TensorType_FLOAT32, {1, 1, 1, 1, 0}}, {TensorType_FLOAT32, {}},
+      Padding_SAME);
+
+  EXPECT_EQ(m.AllocateTensors(), kTfLiteError);
+}
+
+TEST(Conv3dTransposePrepareSecurityTest, RejectsZeroFilterOutputChannels) {
+  PrepareOnlyConv3dTransposeOpModel m({1, 1, 1, 1, 1},
+                                      {TensorType_FLOAT32, {1, 1, 1, 0, 1}},
+                                      {TensorType_FLOAT32, {1, 1, 1, 1, 1}},
+                                      {TensorType_FLOAT32, {}}, Padding_SAME);
+
+  EXPECT_EQ(m.AllocateTensors(), kTfLiteError);
 }
 
 TEST_P(Conv3dTransposeOpTest, SimpleFloat32Test) {
@@ -166,7 +229,7 @@ TEST_P(Conv3dTransposeOpTest, SimpleFloat32Test) {
   m.SetInput(CreateRangeVector<float>(32));
   m.SetFilter({-1, -1, -1, -1, -1, 1, -1, 1, -1, 1,  1,  1, 1, 1,  -1, -1,
                1,  -1, 1,  1,  1,  1, -1, 1, -1, -1, -1, 1, 1, -1, 1,  -1});
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutputShape(), ElementsAre(1, 3, 3, 5, 2));
   EXPECT_THAT(
@@ -190,7 +253,7 @@ TEST_P(Conv3dTransposeOpTest, PaddingValidTest) {
   m.SetInput(CreateRangeVector<float>(120));
   m.SetFilter({-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 1, 1,  1, -1, -1,
                1,  1,  -1, 1,  -1, 1,  -1, 1,  -1, -1, -1, 1, -1, 1, 1,  1});
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutputShape(), ElementsAre(1, 4, 5, 6, 2));
   EXPECT_THAT(
@@ -229,7 +292,7 @@ TEST_P(Conv3dTransposeOpTest, PaddingSameTest) {
   m.SetInput(CreateRangeVector<float>(120));
   m.SetFilter({1,  -1, 1,  -1, 1,  -1, -1, 1, 1, -1, -1, 1, 1,  -1, -1, 1,
                -1, 1,  -1, 1,  -1, -1, -1, 1, 1, 1,  1,  1, -1, 1,  -1, 1});
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutputShape(), ElementsAre(1, 3, 4, 5, 2));
   EXPECT_THAT(
@@ -255,7 +318,7 @@ TEST_P(Conv3dTransposeOpTest, PaddingValidComplexTest) {
   m.SetInput(CreateRangeVector<float>(24));
   m.SetFilter({1, -1, 1, 1, -1, 1, 1, -1, 1, -1, -1, -1, -1, 1, 1, 1,
                1, -1, 1, 1, -1, 1, 1, -1, 1, -1, -1, -1, -1, 1, 1, 1});
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutputShape(), ElementsAre(2, 4, 3, 2, 2));
   EXPECT_THAT(
@@ -280,7 +343,7 @@ TEST_P(Conv3dTransposeOpTest, StrideTest) {
   m.SetInput(CreateRangeVector<float>(16));
   m.SetFilter({1, -1, 1, 1, -1, 1, 1, -1, 1, -1, -1, -1, -1, 1, 1, 1,
                1, -1, 1, 1, -1, 1, 1, -1, 1, -1, -1, -1, -1, 1, 1, 1});
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutputShape(), ElementsAre(2, 4, 3, 2, 2));
   EXPECT_THAT(
@@ -305,7 +368,7 @@ TEST_P(Conv3dTransposeOpTest, StrideAndPaddingSameTest) {
   m.SetInput(CreateRangeVector<float>(16));
   m.SetFilter({1, -1, 1, 1, -1, 1, 1, -1, 1, -1, -1, -1, -1, 1, 1, 1,
                1, -1, 1, 1, -1, 1, 1, -1, 1, -1, -1, -1, -1, 1, 1, 1});
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutputShape(), ElementsAre(2, 4, 2, 1, 2));
   EXPECT_THAT(m.GetOutput(),
@@ -327,7 +390,7 @@ TEST_P(Conv3dTransposeOpTest, DilationTest) {
 
   m.SetInput(CreateRangeVector<float>(3));
   m.SetFilter({1, -1, 1, 1, -1, 1, 1, -1});
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutputShape(), ElementsAre(1, 3, 3, 2, 2));
   EXPECT_THAT(m.GetOutput(),
@@ -347,7 +410,7 @@ TEST_P(Conv3dTransposeOpTest, BiasTest) {
   m.SetFilter({1, -1, 1, 1, -1, 1, 1, -1, 1, -1, -1, -1, -1, 1, 1, 1,
                1, -1, 1, 1, -1, 1, 1, -1, 1, -1, -1, -1, -1, 1, 1, 1});
   m.SetBias({1, 2});
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutputShape(), ElementsAre(2, 4, 3, 2, 2));
   EXPECT_THAT(

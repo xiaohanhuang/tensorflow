@@ -14,19 +14,24 @@ limitations under the License.
 ==============================================================================*/
 
 #include <algorithm>
+#include <cstdint>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
-#include "tensorflow/core/framework/kernel_def_builder.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
 #include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/framework/op_requires.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/framework/tensor_slice.h"
 #include "tensorflow/core/framework/tensor_types.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/gtl/map_util.h"
-#include "tensorflow/core/platform/logging.h"
+#include "tensorflow/core/platform/strcat.h"
 #include "tensorflow/core/util/tensor_bundle/tensor_bundle.h"
 
 namespace tensorflow {
@@ -34,9 +39,9 @@ namespace tensorflow {
 namespace {
 // Returning a Status instead of using OP_REQUIRES directly since that doesn't
 // seem to work outside the main OpKernel functions.
-Status RemapVectorToMap(
+absl::Status RemapVectorToMap(
     const TTypes<const int64_t>::Vec& remapping, std::vector<bool>* id_present,
-    std::unordered_map<int64_t, int64_t>* old_id_to_new_id) {
+    absl::flat_hash_map<int64_t, int64_t>* old_id_to_new_id) {
   id_present->clear();
   id_present->resize(remapping.size(), false);
   for (int i = 0; i < remapping.size(); ++i) {
@@ -50,7 +55,7 @@ Status RemapVectorToMap(
                           ", which is not supported."));
     }
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 }  // anonymous namespace
 
@@ -68,56 +73,30 @@ class LoadAndRemapMatrixOp : public OpKernel {
   }
 
   void Compute(OpKernelContext* context) override {
-    // Checks what we're remapping and inverts the relevant remapping Tensors to
-    // be maps with key = old ID, value = new ID.
-    std::unordered_map<int64_t, int64_t> old_row_to_new_row_map;
-    std::vector<bool> row_id_present;
+    // Checks what we're remapping and inverts the relevant remapping Tensors.
     const Tensor* row_remapping_t;
     OP_REQUIRES_OK(context, context->input("row_remapping", &row_remapping_t));
+    OP_REQUIRES(
+        context, row_remapping_t->dims() == 1,
+        errors::InvalidArgument("The `row_remapping` tensor must be 1-D, got "
+                                "a tensor of shape ",
+                                row_remapping_t->shape().DebugString()));
     const auto row_remapping = row_remapping_t->vec<int64_t>();
     OP_REQUIRES(context, row_remapping.size() == num_rows_,
-                errors::InvalidArgument(strings::StrCat(
+                errors::InvalidArgument(absl::StrCat(
                     "Size of row_remapping is ", row_remapping.size(),
                     " instead of being equal to num_rows=", num_rows_)));
-    OP_REQUIRES_OK(context, RemapVectorToMap(row_remapping, &row_id_present,
-                                             &old_row_to_new_row_map));
 
-    // Calculates the min/max old row ID that we need to read, to save us from
-    // reading some unnecessary slices of the old tensor.
-    int64_t min_old_row = -1;
-    int64_t max_old_row = -1;
-    for (int i = 0; i < row_remapping.size(); ++i) {
-      if (min_old_row < 0 ||
-          (row_remapping(i) >= 0 && row_remapping(i) < min_old_row)) {
-        min_old_row = row_remapping(i);
-      }
-      if (max_old_row < 0 ||
-          (row_remapping(i) >= 0 && row_remapping(i) > max_old_row)) {
-        max_old_row = row_remapping(i);
-      }
-    }
-
-    // Processes the remapping for columns.
-    std::unordered_map<int64_t, int64_t> old_col_to_new_col_map;
-    std::vector<bool> col_id_present;
     const Tensor* col_remapping_t;
     OP_REQUIRES_OK(context, context->input("col_remapping", &col_remapping_t));
     const auto col_remapping = col_remapping_t->vec<int64_t>();
-    // Note that we always "remap rows", even when the row vocabulary does
-    // not change, because partitioning requires a mapping from partitioned
-    // Variables to the full checkpoints we load.
     const bool remap_cols = col_remapping.size() > 0;
     if (remap_cols) {
       OP_REQUIRES(
           context, col_remapping.size() == num_cols_,
-          errors::InvalidArgument(strings::StrCat(
+          errors::InvalidArgument(absl::StrCat(
               "Provided col_remapping, but its size is ", col_remapping.size(),
               " instead of being equal to num_cols=", num_cols_)));
-      OP_REQUIRES_OK(context, RemapVectorToMap(col_remapping, &col_id_present,
-                                               &old_col_to_new_col_map));
-    } else {
-      col_id_present.clear();
-      col_id_present.resize(num_cols_, true);
     }
 
     // Processes the checkpoint source and the provided Tensor name.
@@ -128,11 +107,17 @@ class LoadAndRemapMatrixOp : public OpKernel {
         errors::InvalidArgument("The `ckpt_path` tensor must have exactly one "
                                 "element, got tensor of shape ",
                                 ckpt_path_t->shape().DebugString()));
-    const string& ckpt_path = ckpt_path_t->scalar<tstring>()();
+    const std::string& ckpt_path = ckpt_path_t->scalar<tstring>()();
+
     const Tensor* old_tensor_name_t;
     OP_REQUIRES_OK(context,
                    context->input("old_tensor_name", &old_tensor_name_t));
-    const string& old_tensor_name = old_tensor_name_t->scalar<tstring>()();
+    OP_REQUIRES(context, old_tensor_name_t->NumElements() == 1,
+                absl::InvalidArgumentError(absl::StrCat(
+                    "The `old_tensor_name` tensor must have exactly one "
+                    "element, got tensor of shape ",
+                    old_tensor_name_t->shape().DebugString())));
+    const std::string& old_tensor_name = old_tensor_name_t->scalar<tstring>()();
 
     LOG(INFO) << "Processing checkpoint : " << ckpt_path;
     BundleReader reader(context->env(), ckpt_path);
@@ -154,6 +139,57 @@ class LoadAndRemapMatrixOp : public OpKernel {
             "Tensor ", old_tensor_name, " has shape ",
             tensor_shape.DebugString(), " of invalid rank ",
             tensor_shape.dims(), " instead of expected shape of rank 2.")));
+
+    // Processes the remapping for rows.
+    absl::flat_hash_map<int64_t, int64_t> old_row_to_new_row_map;
+    std::vector<bool> row_id_present;
+    OP_REQUIRES_OK(context, RemapVectorToMap(row_remapping, &row_id_present,
+                                             &old_row_to_new_row_map));
+
+    // Calculates the min/max old row ID that we need to read, AND validates
+    // bounds.
+    int64_t min_old_row = -1;
+    int64_t max_old_row = -1;
+    for (int i = 0; i < row_remapping.size(); ++i) {
+      const int64_t old_row = row_remapping(i);
+      if (old_row >= 0) {
+        OP_REQUIRES(context, old_row < tensor_shape.dim_size(0),
+                    absl::InvalidArgumentError(
+                        absl::StrCat("Row remapping index ", old_row,
+                                     " is out of bounds for old tensor with ",
+                                     tensor_shape.dim_size(0), " rows.")));
+
+        if (min_old_row < 0 || old_row < min_old_row) {
+          min_old_row = old_row;
+        }
+        if (max_old_row < 0 || old_row > max_old_row) {
+          max_old_row = old_row;
+        }
+      }
+    }
+
+    // Processes the remapping for columns.
+    absl::flat_hash_map<int64_t, int64_t> old_col_to_new_col_map;
+    std::vector<bool> col_id_present;
+    if (remap_cols) {
+      // Validate column remapping bounds.
+      for (int i = 0; i < col_remapping.size(); ++i) {
+        const int64_t old_col = col_remapping(i);
+        if (old_col >= 0) {
+          OP_REQUIRES(context, old_col < tensor_shape.dim_size(1),
+                      absl::InvalidArgumentError(
+                          absl::StrCat("Col remapping index ", old_col,
+                                       " is out of bounds for old tensor with ",
+                                       tensor_shape.dim_size(1), " columns.")));
+        }
+      }
+
+      OP_REQUIRES_OK(context, RemapVectorToMap(col_remapping, &col_id_present,
+                                               &old_col_to_new_col_map));
+    } else {
+      col_id_present.clear();
+      col_id_present.resize(num_cols_, true);
+    }
 
     if (!remap_cols) {
       // TODO(weiho): Consider relaxing this restriction to allow partial column

@@ -15,10 +15,11 @@ limitations under the License.
 #include <stdint.h>
 
 #include <algorithm>
+#include <limits>
 #include <tuple>
 #include <utility>
 
-#include "tensorflow/lite/c/common.h"
+#include "tensorflow/lite/core/c/common.h"
 #include "tensorflow/lite/kernels/internal/reference/reference_ops.h"
 #include "tensorflow/lite/kernels/internal/tensor.h"
 #include "tensorflow/lite/kernels/internal/tensor_ctypes.h"
@@ -35,17 +36,43 @@ constexpr int kInputMultipliers = 1;
 constexpr int kOutputTensor = 0;
 
 namespace {
+struct OpData {
+  // Indicates that 'Eval' is a noop as the output as written during 'Prepare'.
+  bool noop;
+};
+
 template <typename T>
-TfLiteIntArray* MultiplyShapeDims(const TfLiteIntArray& shape,
-                                  const TfLiteTensor* multipliers,
-                                  int num_dimensions) {
+TfLiteStatus MultiplyShapeDims(TfLiteContext* context,
+                               const TfLiteIntArray& shape,
+                               const TfLiteTensor* multipliers,
+                               int num_dimensions,
+                               TfLiteIntArray** output_shape) {
   const T* multipliers_v = GetTensorData<T>(multipliers);
 
-  TfLiteIntArray* output_shape = TfLiteIntArrayCreate(num_dimensions);
-  for (int i = 0; i < num_dimensions; ++i) {
-    output_shape->data[i] = shape.data[i] * multipliers_v[i];
+  TfLiteIntArray* temp_shape = TfLiteIntArrayCreate(num_dimensions);
+  if (temp_shape == nullptr) {
+    TF_LITE_KERNEL_LOG(context, "Failed to allocate memory for output shape.");
+    return kTfLiteError;
   }
-  return output_shape;
+  for (int i = 0; i < num_dimensions; ++i) {
+    int64_t shape_data = static_cast<int64_t>(shape.data[i]);
+    int64_t multiplier = static_cast<int64_t>(multipliers_v[i]);
+
+    if (shape_data < 0 || multiplier < 0 ||
+        (shape_data > 0 &&
+         multiplier > std::numeric_limits<int32_t>::max() / shape_data)) {
+      TfLiteIntArrayFree(temp_shape);
+      TF_LITE_KERNEL_LOG(context,
+                         "Cannot multiply %lld and %lld. Output shape "
+                         "dimensions must be in range [0, INT32_MAX].",
+                         static_cast<long long>(shape_data),
+                         static_cast<long long>(multiplier));
+      return kTfLiteError;
+    }
+    temp_shape->data[i] = static_cast<int32_t>(shape_data * multiplier);
+  }
+  *output_shape = temp_shape;
+  return kTfLiteOk;
 }
 
 TfLiteStatus ResizeOutput(TfLiteContext* context, TfLiteNode* node) {
@@ -61,23 +88,25 @@ TfLiteStatus ResizeOutput(TfLiteContext* context, TfLiteNode* node) {
   const int num_dimensions = NumDimensions(input);
   const int num_multipliers = NumElements(multipliers);
   TF_LITE_ENSURE_EQ(context, num_dimensions, num_multipliers);
+  TfLiteIntArray* output_shape = nullptr;
   switch (multipliers->type) {
     case kTfLiteInt32:
-      return context->ResizeTensor(
-          context, output,
-          MultiplyShapeDims<int32_t>(*input->dims, multipliers,
-                                     num_dimensions));
+      TF_LITE_ENSURE_OK(context, MultiplyShapeDims<int32_t>(
+                                     context, *input->dims, multipliers,
+                                     num_dimensions, &output_shape));
+      break;
     case kTfLiteInt64:
-      return context->ResizeTensor(
-          context, output,
-          MultiplyShapeDims<int64_t>(*input->dims, multipliers,
-                                     num_dimensions));
+      TF_LITE_ENSURE_OK(context, MultiplyShapeDims<int64_t>(
+                                     context, *input->dims, multipliers,
+                                     num_dimensions, &output_shape));
+      break;
     default:
-      context->ReportError(
-          context, "Multipliers of type '%s' are not supported by tile.",
-          TfLiteTypeGetName(multipliers->type));
+      TF_LITE_KERNEL_LOG(context,
+                         "Multipliers of type '%s' are not supported by tile.",
+                         TfLiteTypeGetName(multipliers->type));
       return kTfLiteError;
   }
+  return context->ResizeTensor(context, output, output_shape);
 }
 
 template <typename T, typename M>
@@ -216,9 +245,50 @@ void TileString(const TfLiteIntArray& in_dimensions,
 }
 }  // namespace
 
+TfLiteStatus EvalImpl(TfLiteContext* context, const TfLiteTensor* input,
+                      const TfLiteTensor* multipliers, TfLiteTensor* output) {
+  if (GetTensorShape(output).FlatSize() == 0) {
+    if (output->type == kTfLiteString) {
+      // For safety, ensure that we write to the output tensor.
+      DynamicBuffer buffer;
+      buffer.WriteToTensor(output, /*new_shape=*/nullptr);
+    }
+    return kTfLiteOk;
+  }
+
+  if (output->type == kTfLiteString) {
+    DynamicBuffer buffer;
+    TileString(*(input->dims), input, multipliers, &buffer, output);
+    buffer.WriteToTensor(output, /*new_shape=*/nullptr);
+    return kTfLiteOk;
+  }
+
+  switch (TfLiteTypeGetSizeBits(output->type)) {
+    case 8:
+      Tile<int8_t>(*(input->dims), input, multipliers, output);
+      break;
+    case 16:
+      Tile<int16_t>(*(input->dims), input, multipliers, output);
+      break;
+    case 32:
+      Tile<int32_t>(*(input->dims), input, multipliers, output);
+      break;
+    case 64:
+      Tile<int64_t>(*(input->dims), input, multipliers, output);
+      break;
+    default:
+      TF_LITE_KERNEL_LOG(context, "Type '%s' is not supported by tile.",
+                         TfLiteTypeGetName(output->type));
+      return kTfLiteError;
+  }
+  return kTfLiteOk;
+}
+
 TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
   TF_LITE_ENSURE_EQ(context, NumInputs(node), 2);
   TF_LITE_ENSURE_EQ(context, NumOutputs(node), 1);
+  OpData* op_data = reinterpret_cast<OpData*>(node->user_data);
+  op_data->noop = false;
 
   const TfLiteTensor* input;
   TF_LITE_ENSURE_OK(context, GetInputSafe(context, node, kInputTensor, &input));
@@ -233,13 +303,19 @@ TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
       context, GetInputSafe(context, node, kInputMultipliers, &multipliers));
   // Only int32 and int64 multipliers type is supported.
   if (multipliers->type != kTfLiteInt32 && multipliers->type != kTfLiteInt64) {
-    context->ReportError(context,
-                         "Multipliers of type '%s' are not supported by tile.",
-                         TfLiteTypeGetName(multipliers->type));
+    TF_LITE_KERNEL_LOG(context,
+                       "Multipliers of type '%s' are not supported by tile.",
+                       TfLiteTypeGetName(multipliers->type));
     return kTfLiteError;
   }
 
-  if (IsConstantTensor(multipliers)) {
+  if (IsConstantOrPersistentTensor(multipliers)) {
+    if (IsConstantOrPersistentTensor(input)) {
+      SetTensorToPersistentRo(output);
+      TF_LITE_ENSURE_OK(context, ResizeOutput(context, node));
+      op_data->noop = true;
+      return EvalImpl(context, input, multipliers, output);
+    }
     TF_LITE_ENSURE_OK(context, ResizeOutput(context, node));
   } else {
     SetTensorToDynamic(output);
@@ -257,49 +333,27 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
   TF_LITE_ENSURE_OK(
       context, GetInputSafe(context, node, kInputMultipliers, &multipliers));
 
+  if (reinterpret_cast<OpData*>(node->user_data)->noop) {
+    return kTfLiteOk;
+  }
   if (IsDynamicTensor(output)) {
     TF_LITE_ENSURE_OK(context, ResizeOutput(context, node));
   }
-  if (GetTensorShape(output).FlatSize() == 0) {
-    return kTfLiteOk;
-  }
+  return EvalImpl(context, input, multipliers, output);
+}
 
-  switch (output->type) {
-    case kTfLiteFloat32:
-      Tile<float>(*(input->dims), input, multipliers, output);
-      break;
-    case kTfLiteInt8:
-      Tile<int8_t>(*(input->dims), input, multipliers, output);
-      break;
-    case kTfLiteUInt8:
-      Tile<uint8_t>(*(input->dims), input, multipliers, output);
-      break;
-    case kTfLiteInt32:
-      Tile<int32_t>(*(input->dims), input, multipliers, output);
-      break;
-    case kTfLiteInt64:
-      Tile<int64_t>(*(input->dims), input, multipliers, output);
-      break;
-    case kTfLiteString: {
-      DynamicBuffer buffer;
-      TileString(*(input->dims), input, multipliers, &buffer, output);
-      buffer.WriteToTensor(output, /*new_shape=*/nullptr);
-      break;
-    }
-    case kTfLiteBool:
-      Tile<bool>(*(input->dims), input, multipliers, output);
-      break;
-    default:
-      context->ReportError(context, "Type '%s' is not supported by tile.",
-                           TfLiteTypeGetName(output->type));
-      return kTfLiteError;
-  }
-  return kTfLiteOk;
+void* Init(TfLiteContext* context, const char* buffer, size_t length) {
+  return new OpData;
+}
+
+void Free(TfLiteContext* context, void* buffer) {
+  delete reinterpret_cast<OpData*>(buffer);
 }
 
 }  // namespace tile
 TfLiteRegistration* Register_TILE() {
-  static TfLiteRegistration r = {nullptr, nullptr, tile::Prepare, tile::Eval};
+  static TfLiteRegistration r = {tile::Init, tile::Free, tile::Prepare,
+                                 tile::Eval};
   return &r;
 }
 }  // namespace builtin

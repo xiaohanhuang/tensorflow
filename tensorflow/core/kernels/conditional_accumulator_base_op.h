@@ -76,10 +76,10 @@ class ConditionalAccumulatorBaseOp : public OpKernel {
   virtual void SetHandleToOutput(OpKernelContext* ctx)
       TF_SHARED_LOCKS_REQUIRED(mu_) = 0;
 
-  virtual Status CheckSignature(OpKernelContext* ctx) = 0;
+  virtual absl::Status CheckSignature(OpKernelContext* ctx) = 0;
 
  protected:
-  typedef std::function<Status(ConditionalAccumulatorBase**)> Creator;
+  typedef std::function<absl::Status(ConditionalAccumulatorBase**)> Creator;
 
   // Subclasses must override this
   virtual Creator GetCreator() const = 0;
@@ -88,13 +88,13 @@ class ConditionalAccumulatorBaseOp : public OpKernel {
   DataType dtype_;
   PartialTensorShape shape_;
   ContainerInfo cinfo_;
-  string reduction_type_;
+  std::string reduction_type_;
   mutex mu_;
   Tensor accumulator_ TF_GUARDED_BY(mu_);
   bool accumulator_set_ TF_GUARDED_BY(mu_);
 
  private:
-  Status SetAccumulatorHandle(OpKernelContext* ctx)
+  absl::Status SetAccumulatorHandle(OpKernelContext* ctx)
       TF_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
     TF_RETURN_IF_ERROR(cinfo_.Init(ctx->resource_manager(), def()));
 
@@ -116,7 +116,7 @@ class ConditionalAccumulatorBaseOp : public OpKernel {
     h(0) = cinfo_.container();
     h(1) = cinfo_.name();
     accumulator_set_ = true;
-    return Status::OK();
+    return absl::OkStatus();
   }
 };
 
@@ -173,9 +173,9 @@ class ConditionalAccumulatorBaseApplyGradientOp
     const Tensor* local_step_tensor;
     OP_REQUIRES_OK(ctx, ctx->input("local_step", &local_step_tensor));
     if (!TensorShapeUtils::IsScalar(local_step_tensor->shape())) {
-      ctx->CtxFailureWithWarning(errors::InvalidArgument(
-          "Argument local_step must be scalar, but had bad shape ",
-          local_step_tensor->shape().DebugString()));
+      ctx->CtxFailureWithWarning(absl::InvalidArgumentError(
+          absl::StrCat("Argument local_step must be scalar, but had bad shape ",
+                       local_step_tensor->shape().DebugString())));
     }
 
     // Actually try to apply gradient now
@@ -245,14 +245,14 @@ class ConditionalAccumulatorBaseTakeGradientOp
     OP_REQUIRES_OK_ASYNC(ctx, ctx->input("num_required", &num_required_tensor),
                          callback);
     if (!TensorShapeUtils::IsScalar(num_required_tensor->shape())) {
-      ctx->CtxFailureWithWarning(errors::InvalidArgument(
+      ctx->CtxFailureWithWarning(absl::InvalidArgumentError(absl::StrCat(
           "Argument num_required must be scalar, but had bad shape ",
-          num_required_tensor->shape().DebugString()));
+          num_required_tensor->shape().DebugString())));
       callback();
     }
 
     // Actually try to take gradient now
-    accumulator->TryTakeGrad(num_required_tensor->scalar<int32>()(), ctx,
+    accumulator->TryTakeGrad(num_required_tensor->scalar<int32_t>()(), ctx,
                              callback);
   }
 };

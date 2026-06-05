@@ -17,7 +17,7 @@ limitations under the License.
 
 #define EIGEN_USE_THREADS
 
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
+#include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/kernels/cwise_ops.h"
 #include "tensorflow/core/kernels/cwise_ops_common.h"
@@ -43,12 +43,13 @@ struct UnaryOpsCompositionBase {
     int cost;
   };
 
-  bool HasComputeFn(const string& name) {
+  bool HasComputeFn(const std::string& name) {
     return compute_fns.find(name) != compute_fns.end();
   }
 
  protected:
-  void RegisterComputeFn(const string& name, ComputeFn compute_fn, int cost) {
+  void RegisterComputeFn(const std::string& name, ComputeFn compute_fn,
+                         int cost) {
     VLOG(5) << "Register compute fn: name=" << name << " cost=" << cost;
     compute_fns[name] = {compute_fn, cost};
   }
@@ -56,23 +57,23 @@ struct UnaryOpsCompositionBase {
  private:
   friend class UnaryOpsComposition<T>;
 
-  Status ExportComputeFns(const std::vector<string>& op_names,
-                          std::vector<ComputeFn>* fns, int* cost) {
-    for (const string& op_name : op_names) {
+  absl::Status ExportComputeFns(const std::vector<std::string>& op_names,
+                                std::vector<ComputeFn>* fns, int* cost) {
+    for (const std::string& op_name : op_names) {
       auto it = compute_fns.find(op_name);
       if (it == compute_fns.end())
-        return errors::InvalidArgument(
-            "Do not have a compute function registered for op: ", op_name);
+        return absl::InvalidArgumentError(absl::StrCat(
+            "Do not have a compute function registered for op: ", op_name));
 
       const ComputeFnRegistration& reg = it->second;
       fns->push_back(reg.compute_fn);
       *cost += reg.cost;
     }
 
-    return Status::OK();
+    return absl::OkStatus();
   }
 
-  std::unordered_map<string, ComputeFnRegistration> compute_fns;
+  std::unordered_map<std::string, ComputeFnRegistration> compute_fns;
 };
 
 template <typename T>
@@ -94,7 +95,7 @@ class UnaryOpsComposition : public OpKernel {
     OP_REQUIRES_OK(context, context->GetAttr("op_names", &op_names_));
 
     OP_REQUIRES(context, !op_names_.empty(),
-                errors::InvalidArgument(
+                absl::InvalidArgumentError(
                     "Unary op composition must have at least one op"));
 
     OP_REQUIRES_OK(context,
@@ -151,7 +152,7 @@ class UnaryOpsComposition : public OpKernel {
 
   Support support_;
 
-  std::vector<string> op_names_;
+  std::vector<std::string> op_names_;
   std::vector<ComputeFn> fns_;
   int cost_ = 0;
 };
